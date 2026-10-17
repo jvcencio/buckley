@@ -23,6 +23,9 @@ type Config struct {
 	OutcomeRepeatLimit int
 	CycleMaxLength     int
 	CycleRepeats       int
+	// WarnOnSuccessfulRepeats lets unattended mutation work recheck stable
+	// evidence. Failed repeats and explicit execution budgets still stop it.
+	WarnOnSuccessfulRepeats bool
 }
 
 // DefaultConfig is deliberately generous for productive agent work while
@@ -51,9 +54,10 @@ type Decision struct {
 type Governor struct {
 	config Config
 
-	rounds        int
-	toolCalls     int
-	evidenceCalls int
+	rounds         int
+	toolCalls      int
+	evidenceCalls  int
+	lastFailedCall int
 
 	exactCounts   map[string]int
 	outcomeCounts map[string]int
@@ -172,18 +176,22 @@ func (g *Governor) Observe(name, arguments, result string, success bool) Decisio
 
 	actionKey := digest(name + "\x00" + arguments)
 	exactKey := digest(actionKey + "\x00" + fmt.Sprintf("%t", success) + "\x00" + result)
-	// A successful result is evidence about the specific action that produced
-	// it. Different searches can legitimately return the same empty result,
-	// and treating those as one repeated outcome can stop broad discovery
-	// before the agent reaches an edit. Failed outcomes remain argument-agnostic
-	// so changing paths or queries cannot evade a persistent tool failure.
-	outcomeScope := name
-	if success {
-		outcomeScope += "\x00" + arguments
+	// Failed reads of different paths or ranges are distinct attempts. When
+	// the tool reports an error kind, volatile details do not create progress.
+	failureDetail := ""
+	outcomeEvidence := result
+	if !success {
+		if kind := outcomeErrorKind(result); kind != "" {
+			outcomeEvidence = kind
+		}
+		failureDetail = fmt.Sprintf("; arguments=%s; error=%s", truncateIncompleteNoticeText(arguments, 240), truncateIncompleteNoticeText(result, 240))
 	}
-	outcomeKey := digest(outcomeScope + "\x00" + fmt.Sprintf("%t", success) + "\x00" + result)
+	outcomeKey := digest(actionKey + "\x00" + fmt.Sprintf("%t", success) + "\x00" + outcomeEvidence)
 
 	g.toolCalls++
+	if !success {
+		g.lastFailedCall = g.toolCalls
+	}
 	g.evidenceCalls++
 	g.exactCounts[exactKey]++
 	g.outcomeCounts[outcomeKey]++
@@ -204,19 +212,20 @@ func (g *Governor) Observe(name, arguments, result string, success bool) Decisio
 
 	exactCount := g.exactCounts[exactKey]
 	if exactCount >= g.config.ExactRepeatLimit {
-		reason := fmt.Sprintf("%s repeated the same action and received the same result %d times", name, exactCount)
-		return stopDecision("exact_repeat", reason, exactCount)
+		reason := fmt.Sprintf("%s repeated the same action and received the same result %d times", name, exactCount) + failureDetail
+		return g.repeatDecision("exact_repeat", reason, exactCount, success)
 	}
 
 	if width, ok := repeatedSuffix(g.actionHistory, g.config.CycleMaxLength, g.config.CycleRepeats); ok {
 		reason := fmt.Sprintf("tool actions and evidence entered a repeating %d-step cycle", width)
-		return stopDecision("action_cycle", reason, g.config.CycleRepeats)
+		cycleSucceeded := g.lastFailedCall <= g.toolCalls-width*g.config.CycleRepeats
+		return g.repeatDecision("action_cycle", reason, g.config.CycleRepeats, cycleSucceeded)
 	}
 
 	outcomeCount := g.outcomeCounts[outcomeKey]
 	if outcomeCount >= g.config.OutcomeRepeatLimit {
-		reason := fmt.Sprintf("%s produced the same outcome %d times despite repeated attempts", name, outcomeCount)
-		return stopDecision("outcome_repeat", reason, outcomeCount)
+		reason := fmt.Sprintf("%s produced the same outcome %d times despite repeated attempts", name, outcomeCount) + failureDetail
+		return g.repeatDecision("outcome_repeat", reason, outcomeCount, success)
 	}
 
 	if exactCount == g.config.ExactRepeatLimit-1 {
@@ -361,6 +370,14 @@ func stopDecision(kind, reason string, count int) Decision {
 	}
 }
 
+func (g *Governor) repeatDecision(kind, reason string, count int, success bool) Decision {
+	if success && g.config.WarnOnSuccessfulRepeats {
+		return Decision{Kind: kind + "_warning", Reason: reason, Count: count,
+			Nudge: "Harness notice: " + reason + ". Change strategy if this check is not needed to complete the task."}
+	}
+	return stopDecision(kind, reason, count)
+}
+
 func (g *Governor) appendAction(action string) {
 	g.actionHistory = append(g.actionHistory, action)
 	maxHistory := g.config.CycleMaxLength * g.config.CycleRepeats * 2
@@ -432,4 +449,19 @@ func canonicalEvidence(raw string) string {
 func digest(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:16])
+}
+
+func outcomeErrorKind(result string) string {
+	var data struct {
+		ErrorKind string `json:"error_kind"`
+	}
+	if json.Unmarshal([]byte(result), &data) == nil && data.ErrorKind != "" {
+		return data.ErrorKind
+	}
+	for _, kind := range []string{"file_not_found", "file_access", "file_too_large", "binary_file", "line_too_large", "invalid_page"} {
+		if strings.Contains(result, "["+kind+"]") {
+			return kind
+		}
+	}
+	return ""
 }

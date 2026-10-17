@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -18,7 +19,57 @@ import (
 // ReadFileTool reads a file from disk
 type ReadFileTool struct {
 	workDirAware
-	sourceScope *agentcoord.SourceScope
+	sourceScope         *agentcoord.SourceScope
+	outsideWorkDirReads bool
+	deniedReadPaths     []string
+}
+
+// SetOutsideWorkDirReads enables host reads for an explicitly unrestricted
+// session. Source scopes and denied paths still apply.
+func (t *ReadFileTool) SetOutsideWorkDirReads(allowed bool, deniedPaths []string) {
+	t.outsideWorkDirReads = allowed
+	t.deniedReadPaths = append([]string(nil), deniedPaths...)
+}
+
+func (t *ReadFileTool) resolveReadPath(path string) (string, error) {
+	if !t.outsideWorkDirReads || t.sourceScope != nil {
+		return resolvePath(t.workDir, path)
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("path cannot be empty")
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(t.workDir, path)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("invalid path: %w", err)
+	}
+	resolvedTarget := evalSymlinksFallbackForTarget(abs)
+	for _, denied := range t.deniedReadPaths {
+		denied = strings.TrimSpace(denied)
+		if denied == "" {
+			continue
+		}
+		if denied == "~" || strings.HasPrefix(denied, "~/") {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", fmt.Errorf("resolve denied home path: %w", err)
+			}
+			denied = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(denied, "~"), "/"))
+		}
+		if !filepath.IsAbs(denied) {
+			denied = filepath.Join(t.workDir, denied)
+		}
+		denied, err = filepath.Abs(denied)
+		if err != nil {
+			return "", fmt.Errorf("invalid denied path: %w", err)
+		}
+		if isWithinDir(denied, abs) || isWithinDir(evalSymlinksFallback(denied), resolvedTarget) {
+			return "", fmt.Errorf("path %q is denied", path)
+		}
+	}
+	return abs, nil
 }
 
 // SetSourceScope validates and installs a deep copy of the scope. A nil scope
@@ -133,43 +184,66 @@ func (t *ReadFileTool) Execute(params map[string]any) (*Result, error) {
 		}, nil
 	}
 
+	if t.sourceScope == nil {
+		// Source-scoped reads stay strict; ordinary reads tolerate placeholders.
+		params = normalizeReadFileParams(params)
+	}
 	selected, err := t.sourceFileForPath(path)
 	if err != nil {
 		return &Result{Success: false, Error: err.Error()}, nil
 	}
-	absPath, err := resolvePath(t.workDir, path)
+	absPath, err := t.resolveReadPath(path)
 	if err != nil {
-		return &Result{
-			Success: false,
-			Error:   err.Error(),
-		}, nil
+		result := readFileFailure("file_access", fmt.Sprintf("%s: %v; use find_files for paths within the allowed workspace %s", path, err, t.workDir))
+		if selected != nil {
+			result.Data = nil
+		}
+		return result, nil
 	}
 
-	if t.maxFileSizeBytes > 0 {
-		if info, err := os.Stat(absPath); err == nil && info.Size() > t.maxFileSizeBytes {
-			return &Result{
-				Success: false,
-				Error:   fmt.Sprintf("file too large: %d bytes (max %d)", info.Size(), t.maxFileSizeBytes),
-			}, nil
+	snapshotLimit := t.maxFileSizeBytes
+	if snapshotLimit <= 0 && selected == nil {
+		snapshotLimit = defaultReadFileSnapshotBytes
+	}
+	if snapshotLimit > 0 {
+		if info, err := os.Stat(absPath); err == nil && info.Size() > snapshotLimit {
+			if selected != nil {
+				return readFileFailure("file_too_large", fmt.Sprintf("%s has %d bytes (snapshot limit %d); select a smaller source file", absPath, info.Size(), t.maxFileSizeBytes)), nil
+			}
+			return t.readLargeFilePage(absPath, params, info.Size(), snapshotLimit)
 		}
 	}
 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
-		return &Result{
-			Success: false,
-			Error:   fmt.Sprintf("failed to read file: %v", err),
-		}, nil
+		kind := "file_access"
+		if os.IsNotExist(err) {
+			kind = "file_not_found"
+		}
+		return readFileFailure(kind, fmt.Sprintf("cannot read %s: %v; paths are relative to %s; use find_files to locate the file", absPath, err, t.workDir)), nil
 	}
 
+	if bytes.IndexByte(content, 0) >= 0 {
+		return readFileFailure("binary_file", fmt.Sprintf("%s contains NUL bytes; use a format-specific tool or a bounded hex dump through run_shell", absPath)), nil
+	}
 	contentStr := string(content)
 	lines := fileLines(contentStr)
-	if anchorValue, hasAnchor := params["anchor"]; hasAnchor {
+	if _, hasAnchor := params["anchor"]; hasAnchor {
 		_, hasStart := params["start_line"]
 		_, hasEnd := params["end_line"]
 		if hasStart || hasEnd {
-			return &Result{Success: false, Error: "anchor is mutually exclusive with start_line/end_line; omit anchor for an explicit start_line/end_line range, or omit both line selectors for an anchor read"}, nil
+			if t.sourceScope != nil {
+				return &Result{Success: false, Error: "anchor is mutually exclusive with start_line/end_line; omit anchor for an explicit start_line/end_line range, or omit both line selectors for an anchor read"}, nil
+			}
 		}
+		if (hasStart || hasEnd) && t.sourceScope == nil {
+			// Models often send both selectors. An explicit line range is
+			// unambiguous, so honor it and ignore the anchor instead of failing.
+			params = maps.Clone(params)
+			delete(params, "anchor")
+		}
+	}
+	if anchorValue, hasAnchor := params["anchor"]; hasAnchor {
 		anchor, ok := anchorValue.(string)
 		if !ok {
 			return &Result{Success: false, Error: "anchor parameter must be a string"}, nil
@@ -293,6 +367,43 @@ func fileLines(content string) []string {
 		return lines[:len(lines)-1]
 	}
 	return lines
+}
+
+// normalizeReadFileParams drops placeholder values that models send for unused
+// optional arguments: an empty anchor, zero or negative line numbers, and null
+// values. It returns a copy and never mutates the caller's map.
+func normalizeReadFileParams(params map[string]any) map[string]any {
+	out := maps.Clone(params)
+	if out == nil {
+		return params
+	}
+	for _, key := range []string{"anchor", "start_line", "end_line"} {
+		value, ok := out[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case nil:
+			delete(out, key)
+		case string:
+			if key == "anchor" && strings.TrimSpace(typed) == "" {
+				delete(out, key)
+			}
+		case float64:
+			if typed == 0 {
+				delete(out, key)
+			}
+		case int:
+			if typed == 0 {
+				delete(out, key)
+			}
+		case int64:
+			if typed == 0 {
+				delete(out, key)
+			}
+		}
+	}
+	return out
 }
 
 func readFilePage(params map[string]any, totalLines int) (startLine, endLine int, explicitPage bool, err error) {

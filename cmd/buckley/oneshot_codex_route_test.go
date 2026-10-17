@@ -45,16 +45,21 @@ func blockRealCodex(t *testing.T) {
 
 func TestNewOneshotToolInvoker_CodexProviderRouteUsesSchemaConstrainedCLI(t *testing.T) {
 	tests := []struct {
-		name      string
-		requested string
-		selected  string
-		viaEnv    bool
-		wantModel string
+		name            string
+		requested       string
+		selected        string
+		defaultProvider string
+		reasoning       string
+		viaEnv          bool
+		wantModel       string
 	}{
 		{name: "provider prefix is stripped", requested: "codex/gpt-6-luna", wantModel: "gpt-6-luna"},
 		{name: "default model omits the model flag", requested: "codex/default"},
 		{name: "routing selection wins over the request", requested: "route-alias", selected: "codex/gpt-6.1-sol", wantModel: "gpt-6.1-sol"},
 		{name: "blank provider command falls back to the environment", requested: "codex/gpt-6-luna", viaEnv: true, wantModel: "gpt-6-luna"},
+		{name: "unprefixed model uses default provider", requested: "gpt-6-luna", defaultProvider: "codex", wantModel: "gpt-6-luna"},
+		{name: "max effort is preserved", requested: "codex/gpt-6-luna", reasoning: "max", wantModel: "gpt-6-luna"},
+		{name: "disabled effort omits override", requested: "codex/gpt-6-luna", reasoning: "off", wantModel: "gpt-6-luna"},
 	}
 
 	for _, tt := range tests {
@@ -63,6 +68,12 @@ func TestNewOneshotToolInvoker_CodexProviderRouteUsesSchemaConstrainedCLI(t *tes
 			script, argvFile := writeFakeCodex(t)
 			cfg := config.DefaultConfig()
 			cfg.Models.Reasoning = "xhigh"
+			if tt.reasoning != "" {
+				cfg.Models.Reasoning = tt.reasoning
+			}
+			if tt.defaultProvider != "" {
+				cfg.Models.DefaultProvider = tt.defaultProvider
+			}
 			cfg.Providers.Codex.Enabled = true
 			cfg.Providers.Codex.Models = []string{"codex/gpt-6-luna", "codex/gpt-6.1-sol"}
 			if tt.viaEnv {
@@ -110,7 +121,18 @@ func TestNewOneshotToolInvoker_CodexProviderRouteUsesSchemaConstrainedCLI(t *tes
 			}
 			args := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
 			assertCodexArg(t, args, "--output-schema", "")
-			assertCodexArg(t, args, "-c", `model_reasoning_effort="xhigh"`)
+			assertCodexArg(t, args, "--sandbox", "read-only")
+			assertCodexArg(t, args, "--ephemeral", "")
+			assertCodexArg(t, args, "-c", `approval_policy="never"`)
+			if tt.reasoning == "off" {
+				for _, arg := range args {
+					if strings.HasPrefix(arg, "model_reasoning_effort=") {
+						t.Fatalf("argv = %q, want no reasoning effort override", args)
+					}
+				}
+			} else {
+				assertCodexArg(t, args, "-c", fmt.Sprintf("model_reasoning_effort=%q", cfg.Models.Reasoning))
+			}
 			if tt.wantModel == "" {
 				for _, arg := range args {
 					if arg == "--model" {

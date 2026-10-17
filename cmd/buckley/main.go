@@ -129,7 +129,9 @@ var newOrchestratorFn = func(store *storage.Store, mgr *model.Manager, registry 
 			rlmrunner.WithGraftClient(graftClient),
 		)
 	}
-	return orchestrator.NewOrchestrator(store, mgr, registry, cfg, workflow, planStore, arbEngine, gtsPipeline)
+	runner := orchestrator.NewOrchestrator(store, mgr, registry, cfg, workflow, planStore, arbEngine, gtsPipeline)
+	runner.SetReviewRecorder(orchestratorReviewRecorder(cfg))
+	return runner
 }
 
 func newRulesEngine() *rules.Engine {
@@ -160,6 +162,7 @@ type startupOptions struct {
 	toolsSet         bool
 	taskIntent       agentloop.TaskIntent
 	taskIntentSet    bool
+	persist          bool
 	codeMode         bool
 	plainModeSet     bool
 	plainMode        bool
@@ -322,7 +325,7 @@ func main() {
 	// Handle one-shot prompt mode (-p flag)
 	if promptFlag != "" {
 		// Prompt provided via -p flag
-		exitCode := executeOneShotWithTaskIntent(promptFlag, cfg, modelManager, store, projectContext, planStore, agentProfile, modelOverrideFlag, opts.tools, opts.codeMode, opts.taskIntent)
+		exitCode := executeOneShotWithTaskIntent(promptFlag, cfg, modelManager, store, projectContext, planStore, agentProfile, modelOverrideFlag, opts.tools, opts.codeMode, opts.taskIntent, opts.persist)
 		os.Exit(exitCode)
 	}
 
@@ -338,13 +341,13 @@ func main() {
 			}
 			if len(lines) > 0 {
 				prompt := strings.Join(lines, "\n")
-				exitCode := executeOneShotWithTaskIntent(prompt, cfg, modelManager, store, projectContext, planStore, agentProfile, modelOverrideFlag, opts.tools, opts.codeMode, opts.taskIntent)
+				exitCode := executeOneShotWithTaskIntent(prompt, cfg, modelManager, store, projectContext, planStore, agentProfile, modelOverrideFlag, opts.tools, opts.codeMode, opts.taskIntent, opts.persist)
 				os.Exit(exitCode)
 			}
 		}
 	}
-	if opts.taskIntentSet {
-		fmt.Fprintln(os.Stderr, "Error: --task-intent is only supported with -p or piped one-shot input")
+	if opts.taskIntentSet || opts.persist {
+		fmt.Fprintln(os.Stderr, "Error: --task-intent and --persist are only supported with -p or piped one-shot input")
 		os.Exit(2)
 	}
 	if opts.toolsSet {
@@ -431,8 +434,8 @@ func executeOneShot(prompt string, cfg *config.Config, mgr *model.Manager, store
 	return executeOneShotWithTaskIntent(prompt, cfg, mgr, store, projectContext, planStore, agentProfile, modelOverride, allowedTools, codeMode, agentloop.UnknownIntent)
 }
 
-func executeOneShotWithTaskIntent(prompt string, cfg *config.Config, mgr *model.Manager, store *storage.Store, projectContext *projectcontext.ProjectContext, planStore orchestrator.PlanStore, agentProfile *agentspec.RuntimeProfile, modelOverride string, allowedTools []string, codeMode bool, taskIntent agentloop.TaskIntent) int {
-	limits := acpLoopLimits{TaskIntent: taskIntent}
+func executeOneShotWithTaskIntent(prompt string, cfg *config.Config, mgr *model.Manager, store *storage.Store, projectContext *projectcontext.ProjectContext, planStore orchestrator.PlanStore, agentProfile *agentspec.RuntimeProfile, modelOverride string, allowedTools []string, codeMode bool, taskIntent agentloop.TaskIntent, persist ...bool) int {
+	limits := acpLoopLimits{TaskIntent: taskIntent, Persist: len(persist) > 0 && persist[0]}
 	return executeOneShotWithLimitsAndOutputSchema(prompt, cfg, mgr, store, projectContext, planStore, agentProfile, modelOverride, allowedTools, codeMode, limits, "")
 }
 
@@ -453,6 +456,19 @@ func executeOneShotWithStepCapAndOutputSchema(prompt string, cfg *config.Config,
 
 func executeOneShotWithLimitsAndOutputSchema(prompt string, cfg *config.Config, mgr *model.Manager, store *storage.Store, projectContext *projectcontext.ProjectContext, planStore orchestrator.PlanStore, agentProfile *agentspec.RuntimeProfile, modelOverride string, allowedTools []string, codeMode bool, limits acpLoopLimits, outputSchema string) int {
 	_ = planStore
+	stopReason := ""
+	unverifiedReason := ""
+	previousOnStop := limits.OnStop
+	limits.OnStop = func(stop agentloop.Termination) {
+		stopReason = stop.StopReason()
+		if stop.Kind == agentloop.TerminationCompletedUnverified {
+			unverifiedReason = stop.Reason
+		}
+		fmt.Fprintf(os.Stderr, "One-shot stop: stop_reason=%q\n", stopReason)
+		if previousOnStop != nil {
+			previousOnStop(stop)
+		}
+	}
 	outputSchema = strings.TrimSpace(outputSchema)
 	var scopeErr error
 	limits, scopeErr = prepareOneShotSourceScope(limits, codeMode)
@@ -460,6 +476,11 @@ func executeOneShotWithLimitsAndOutputSchema(prompt string, cfg *config.Config, 
 		fmt.Fprintf(os.Stderr, "Error: %v\n", scopeErr)
 		return 1
 	}
+	limits.allowHostTools = oneShotHostToolsAllowed(cfg) && !limits.ChildContract && limits.SourceScope == nil
+	if limits.TaskIntent == agentloop.MutationIntent && briefForbidsChanges(prompt) {
+		limits.noChangeExpected = true
+	}
+	limits = applyOneShotPersistence(cfg, limits, os.Stderr)
 	if err := validateSourceTextRequirements(limits.RequiredSourceText); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
@@ -514,6 +535,20 @@ func executeOneShotWithLimitsAndOutputSchema(prompt string, cfg *config.Config, 
 	}
 	registry.ConfigureContainers(cfg, cwd)
 	registry.SetWorkDir(cwd)
+	if limits.allowHostTools && limits.TaskIntent == agentloop.MutationIntent {
+		removeImplicitSubagentDelegation(registry, agentProfile, allowedTools)
+	}
+	if limits.TaskIntent == agentloop.MutationIntent && !limits.ChildContract && limits.SourceScope == nil {
+		registerOneShotVerification(registry)
+	}
+	if limits.allowHostTools {
+		if reader, ok := registry.Get("read_file"); ok {
+			if reader, ok := reader.(*builtin.ReadFileTool); ok {
+				denied := append(append([]string(nil), cfg.Approval.DeniedPaths...), cfg.Sandbox.DeniedPaths...)
+				reader.SetOutsideWorkDirReads(true, denied)
+			}
+		}
+	}
 	if err := bindOneShotSourceScope(registry, limits.SourceScope); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
@@ -607,11 +642,19 @@ func executeOneShotWithLimitsAndOutputSchema(prompt string, cfg *config.Config, 
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 2
 	}
+	if limits.allowHostTools {
+		for _, name := range cfg.Approval.DeniedTools {
+			registry.Remove(strings.TrimSpace(name))
+		}
+	}
 	toolFilter := resolveOneShotToolFilter(agentProfile, registry, allowedTools)
 	if protocolAvailable && adaptiveProtocol.Mode == protocol.ModeDynamic {
 		toolFilter = applyProtocolToolFilter(toolFilter, adaptiveProtocol.VisibleTools)
 	}
 	toolFilter = ensureRequiredOneShotTools(toolFilter, artifactSubmission != nil, codeRuntime != nil)
+	if limits.allowHostTools && limits.TaskIntent == agentloop.MutationIntent {
+		toolFilter = ensureHostMutationTools(toolFilter, registry)
+	}
 	toolFilter = sourceScopeToolFilter(toolFilter, limits.SourceScope)
 	if toolFilter != nil {
 		skillState.SetToolFilter(toolFilter)
@@ -658,6 +701,9 @@ func executeOneShotWithLimitsAndOutputSchema(prompt string, cfg *config.Config, 
 	if instruction := sourceTextRequirementInstruction(limits.RequiredSourceText); instruction != "" {
 		systemPrompt += "\n\n" + instruction
 	}
+	if limits.MaxContinuations > 0 {
+		systemPrompt += "\n\n" + agentloop.PersistenceInstruction
+	}
 	conv.AddSystemMessage(systemPrompt)
 	conv.AddUserMessage(prompt)
 
@@ -667,7 +713,8 @@ func executeOneShotWithLimitsAndOutputSchema(prompt string, cfg *config.Config, 
 		runCtx, cancel = context.WithTimeout(runCtx, time.Duration(limits.MaxElapsedSeconds)*time.Second)
 		defer cancel()
 	}
-	responseText, err := runACPLoopWithLimits(runCtx, cfg, mgr, conv, registry, skillState, engine, resolvedModel, cwd, limits.ParentSessionID, nil, nil, newOneShotProgressStream(os.Stderr), limits)
+	runCtx = withACPReplaySafeStream(runCtx)
+	responseText, err := runACPLoopWithLimits(runCtx, cfg, mgr, conv, registry, skillState, engine, resolvedModel, cwd, limits.ParentSessionID, nil, nil, newOneShotProgressStream(os.Stderr, cwd), limits)
 	if err != nil {
 		codeModeFailure = err
 		if outputSchema == artifactv1.SchemaVersion {
@@ -694,6 +741,10 @@ func executeOneShotWithLimitsAndOutputSchema(prompt string, cfg *config.Config, 
 		responseText = string(artifactJSON)
 	}
 
+	if unverifiedReason != "" && outputSchema == "" {
+		// Say plainly, in the summary a lead reads, that nothing verified the change.
+		responseText = strings.TrimRight(responseText, "\n") + "\n\n[Buckley] Completed without verification: " + unverifiedReason + "."
+	}
 	if responseText != "" {
 		fmt.Print(responseText)
 	}
@@ -701,7 +752,15 @@ func executeOneShotWithLimitsAndOutputSchema(prompt string, cfg *config.Config, 
 		fmt.Println()
 	}
 	codeModeFailure = nil
+	if stopReason != "" {
+		fmt.Fprintf(os.Stderr, "One-shot status: complete (exit=0; stop_reason=%q)\n", stopReason)
+	}
 	return 0
+}
+
+func oneShotHostToolsAllowed(cfg *config.Config) bool {
+	return cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.Approval.Mode), "yolo") &&
+		cfg.Sandbox.AllowUnsafe && strings.EqualFold(strings.TrimSpace(cfg.Sandbox.Mode), "disabled")
 }
 
 const (
@@ -743,7 +802,7 @@ func oneShotTaskIntentInstruction(intent agentloop.TaskIntent) string {
 	return "Read-only context contract: gather only evidence relevant to the request, then finish with a concise summary for the next investigator or orchestrator. Include paths, symbols, or commands that support the summary, call out uncertainty, and do not edit or claim checks you did not run."
 }
 
-const oneShotProgressMinInterval = 10 * time.Second
+const oneShotProgressMinInterval = 30 * time.Second
 
 type oneShotProgress struct {
 	writer        io.Writer
@@ -756,9 +815,10 @@ type oneShotProgress struct {
 	toolCalls     int
 	toolUpdates   int
 	usageUpdates  int
+	tools         *oneShotToolTracker
 }
 
-func newOneShotProgressStream(writer io.Writer) acp.StreamFunc {
+func newOneShotProgressStream(writer io.Writer, workDir string) acp.StreamFunc {
 	if quietMode || writer == nil {
 		return nil
 	}
@@ -767,6 +827,7 @@ func newOneShotProgressStream(writer io.Writer) acp.StreamFunc {
 		now:         time.Now,
 		minInterval: oneShotProgressMinInterval,
 		phase:       "starting",
+		tools:       newOneShotToolTracker(writer, workDir),
 	}
 	return progress.Stream
 }
@@ -785,9 +846,11 @@ func (p *oneShotProgress) Stream(update acp.SessionUpdate) error {
 	case acp.SessionUpdateToolCall:
 		p.phase = "tool"
 		p.toolCalls++
+		p.tools.start(update)
 	case acp.SessionUpdateToolCallUpdate:
 		p.phase = "tool"
 		p.toolUpdates++
+		p.tools.update(update)
 	case acp.SessionUpdateUsageUpdate:
 		p.phase = "usage"
 		p.usageUpdates++
@@ -832,7 +895,7 @@ func printOneShotFailure(responseText string, err error) int {
 			fmt.Println()
 		}
 		fmt.Println("\n[Stream interrupted — the response above is incomplete.]")
-		fmt.Fprintf(os.Stderr, "One-shot status: incomplete (exit=1; partial_output_bytes=%d)\n", len(responseText))
+		fmt.Fprintf(os.Stderr, "One-shot status: incomplete (exit=1; stop_reason=%q; partial_output_bytes=%d)\n", oneShotFailureStopReason(err), len(responseText))
 	case errors.As(err, &incomplete):
 		notice := agentloop.PresentIncompleteResult(err)
 		if responseText != "" {
@@ -842,8 +905,10 @@ func printOneShotFailure(responseText string, err error) int {
 			}
 		}
 		fmt.Printf("\n[%s]\n", notice.Message)
-		fmt.Fprintf(os.Stderr, "One-shot status: incomplete (exit=1; code=%s; preserved_output_bytes=%d)\n", notice.Code, len(responseText))
+		fmt.Fprintf(os.Stderr, "One-shot status: incomplete (exit=1; code=%s; stop_reason=%q; preserved_output_bytes=%d)\n", notice.Code, oneShotFailureStopReason(err), len(responseText))
 		return 1
+	default:
+		fmt.Fprintf(os.Stderr, "One-shot status: incomplete (exit=1; stop_reason=%q)\n", oneShotFailureStopReason(err))
 	}
 	fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
 	return 1
@@ -872,12 +937,26 @@ func printOneShotArtifactFailure(submission *builtin.ArtifactSubmission, err err
 
 	if isIncomplete {
 		notice := agentloop.PresentIncompleteResult(err)
-		fmt.Fprintf(os.Stderr, "One-shot status: %s (exit=1; code=%s)\n", status, notice.Code)
+		fmt.Fprintf(os.Stderr, "One-shot status: %s (exit=1; code=%s; stop_reason=%q)\n", status, notice.Code, oneShotFailureStopReason(err))
 		fmt.Fprintln(os.Stderr, "Incomplete turn; captured evidence preserved in recovery artifact.")
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "One-shot status: %s (exit=1)\nError: %v\n", status, err)
+	fmt.Fprintf(os.Stderr, "One-shot status: %s (exit=1; stop_reason=%q)\nError: %v\n", status, oneShotFailureStopReason(err), err)
 	return 1
+}
+
+func oneShotFailureStopReason(err error) string {
+	var incomplete *agentloop.IncompleteTurnError
+	if errors.As(err, &incomplete) && incomplete.StopReason != "" {
+		return incomplete.StopReason
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	return "error"
 }
 
 func ensureRequiredOneShotTools(filter []string, artifactRequired, codeModeRequired bool) []string {
@@ -918,7 +997,7 @@ func applyOneShotProtocolLimits(limits acpLoopLimits, compiled *protocol.Protoco
 	}
 	stage := adaptiveProtocolExecutionStage(*compiled)
 	if stage.MaxTurns > 0 && (limits.StepCap == 0 || stage.MaxTurns < limits.StepCap) {
-		if !limits.ChildContract || limits.StepCap > 0 {
+		if (!limits.ChildContract && !limits.longMutation) || limits.StepCap > 0 {
 			limits.StepCap = stage.MaxTurns
 		}
 	}
@@ -929,7 +1008,7 @@ func applyOneShotProtocolLimits(limits acpLoopLimits, compiled *protocol.Protoco
 		}
 	}
 	limits.MaxOutputTokens = minPositiveLimit(limits.MaxOutputTokens, stage.Request.MaxOutputTokens, modelMaxOutputTokens)
-	if stage.MaxReadOnlyCalls > 0 {
+	if stage.MaxReadOnlyCalls > 0 && !limits.longMutation {
 		limits.ReadOnlyWarningAt = stage.ReadOnlyWarningAt
 		limits.ReadOnlyActionAt = stage.ReadOnlyActionAt
 		limits.MaxReadOnlyCalls = stage.MaxReadOnlyCalls
@@ -1568,6 +1647,8 @@ func printHelp() {
 	fmt.Println("  execute-task --plan <id> --task <id>")
 	fmt.Println("                                   Execute single task (CI/batch friendly)")
 	fmt.Println("  commit [--dry-run]               Generate structured commit via tool-use (transparent)")
+	fmt.Println("  commit-check [--file msg] [--strict]  Check a commit message with the same safety and style rules as commit")
+	fmt.Println("  hook install|uninstall|status    Manage the commit-msg hook that runs commit-check")
 	fmt.Println("  pr [--dry-run]                   Generate structured PR via tool-use (transparent)")
 	fmt.Println("  review [--scope worktree|branch|changes]")
 	fmt.Println("                                   Review local changes with repository context")
@@ -1582,6 +1663,7 @@ func printHelp() {
 	fmt.Println("  experiment promote <model-id> <profile-version>")
 	fmt.Println("                                   Promote a calibrated profile for dynamic execution")
 	fmt.Println("  eval [list|run|init|runs|show]   Run project chat eval scenarios")
+	fmt.Println("  eval commit [--live] [--json]    Check commit-message safety and style on 30 fixed diffs (CI gate offline)")
 	fmt.Println("  serve [--bind host:port]         Start local HTTP/WebSocket server")
 	fmt.Println("  attach [session-id] [--tui]      Join a running session over loopback gRPC (list if omitted; --tui observes full-screen)")
 	fmt.Println("  goal <start|run|status|report>   Record, run, and inspect durable goals (run drives the live model; list shows recent)")
@@ -1629,6 +1711,7 @@ func printHelp() {
 	fmt.Println("  --code-mode                      Offer audited exec_program for batched repository analysis (requires bubblewrap)")
 	fmt.Println("  --agent <path>                   Load a buckley.agent/v1 runtime profile for this session")
 	fmt.Println("  -m, --model <id>                 Use model for this chat session (for example codex/gpt-5.4-mini)")
+	fmt.Println("  --persist                       Continue one-shot mutation work until complete or blocked")
 	fmt.Println("  --task-intent <intent>           One-shot result contract: unknown, read_only, or mutation")
 	fmt.Println("  --tools <names>                  Limit one-shot model tools (comma-separated, repeatable)")
 	fmt.Println("                                   Approval rules and required protocol tools still apply")
@@ -1648,6 +1731,10 @@ func printHelp() {
 	fmt.Println("  BUCKLEY_CODE_MODE               Enable audited exec_program in interactive or one-shot mode")
 	fmt.Println("  BUCKLEY_MODEL_COMMIT             Override model for `buckley commit`")
 	fmt.Println("  BUCKLEY_MODEL_PR                 Override model for `buckley pr`")
+	fmt.Println("  BUCKLEY_EFFORT_COMMIT            Override reasoning effort for `buckley commit`")
+	fmt.Println("  BUCKLEY_EFFORT_PR                Override reasoning effort for `buckley pr`")
+	fmt.Println("  BUCKLEY_EFFORT_REVIEW            Override reasoning effort for review and buckbot")
+	fmt.Println("  BUCKLEY_ONESHOT_EFFORT           Default reasoning effort for one-shot commands")
 	fmt.Println("  BUCKLEY_ONESHOT_BACKEND          Override one-shot backend: api, codex, or claude")
 	fmt.Println("  BUCKLEY_COMMIT_BACKEND           Override backend for `buckley commit`")
 	fmt.Println("  BUCKLEY_PR_BACKEND               Override backend for `buckley pr`")
@@ -2286,6 +2373,10 @@ func dispatchSubcommand(args []string) (bool, int) {
 		return true, runCommand(runExecuteTaskCommand, args[1:])
 	case "commit":
 		return true, runCommand(runCommitCommand, args[1:])
+	case "commit-check":
+		return true, runCommand(runCommitCheckCommand, args[1:])
+	case "hook":
+		return true, runCommand(runHookCommand, args[1:])
 	case "pr":
 		return true, runCommand(runPRCommand, args[1:])
 	case "review":
@@ -2444,6 +2535,11 @@ func (s *startupFlagState) consumeStartupFlag(opts *startupOptions, arg string, 
 	case "--tui":
 		opts.plainModeSet = true
 		opts.plainMode = false
+	case "--persist":
+		if !beforeCommand {
+			return false, nil
+		}
+		opts.persist = true
 	case "--code-mode":
 		if !beforeCommand {
 			return false, nil

@@ -250,7 +250,7 @@ type ModelConfig struct {
 	VisionFallback  []string            `yaml:"vision_fallback"` // Ordered list of vision models to try
 	FallbackChains  map[string][]string `yaml:"fallback_chains"`
 	DefaultProvider string              `yaml:"default_provider"` // Default provider (openrouter, openai, anthropic, google, codex)
-	// Reasoning level: "off", "minimal", "low", "medium", "high", "xhigh",
+	// Reasoning level: "off", "minimal", "low", "medium", "high", "xhigh", "max",
 	// or "" for auto-detect. BUCKLEY_MODEL_REASONING and its legacy
 	// fallback BUCKLEY_REASONING are handled by the envReasoning hook
 	// (config_env.go), not the generic env-tag dispatcher, because a
@@ -336,6 +336,14 @@ type ProviderSettings struct {
 	Enabled bool   `yaml:"enabled"`
 	APIKey  string `yaml:"api_key"`  // Can be set here or via env var
 	BaseURL string `yaml:"base_url"` // Optional custom base URL
+	// BYOKProviders pins OpenRouter requests to the upstream provider that
+	// holds the operator's own key (OpenRouter "bring your own key").
+	// Keys are model-ID prefixes or exact model IDs (for example "openai/");
+	// values are OpenRouter provider slugs (for example "openai"). A matching
+	// request is sent with provider.only set to that slug, so OpenRouter
+	// cannot route it to an endpoint that bills OpenRouter credits instead of
+	// the operator's key. Only providers.openrouter reads this field.
+	BYOKProviders map[string]string `yaml:"byok_providers,omitempty"`
 }
 
 // OpenAICompatibleConfig configures an OpenAI-compatible API provider.
@@ -479,9 +487,13 @@ type ExecutionModeConfig struct {
 	DaprGRPCEndpoint string `yaml:"dapr_grpc_endpoint" env:"BUCKLEY_DAPR_GRPC_ENDPOINT"`
 }
 
+const DefaultUnattendedMaxContinuations = 200
+
 // OneshotModeConfig controls the strategy for one-shot commands.
 type OneshotModeConfig struct {
-	Mode string `yaml:"mode" env:"BUCKLEY_ONESHOT_MODE"`
+	// Nil selects 200 for unattended mutation sessions and zero otherwise.
+	MaxContinuations *int   `yaml:"max_continuations"`
+	Mode             string `yaml:"mode" env:"BUCKLEY_ONESHOT_MODE"`
 
 	// DataPolicy controls whether the one-shot OpenRouter backend (commit,
 	// PR) attaches provider privacy fields and enforces the goal-engine
@@ -1141,6 +1153,16 @@ type BuckbotConfig struct {
 // independent of the Buckbot model/budget settings above.
 type ReviewConfig struct {
 	Verification ReviewVerificationConfig `yaml:"verification"`
+	Ledger       ReviewLedgerConfig       `yaml:"ledger"`
+}
+
+type ReviewLedgerConfig struct {
+	GCS ReviewLedgerGCSConfig `yaml:"gcs"`
+}
+
+type ReviewLedgerGCSConfig struct {
+	Bucket string `yaml:"bucket"`
+	Prefix string `yaml:"prefix"`
 }
 
 // ReviewVerificationConfig controls how the review harness runs build/test
@@ -1158,7 +1180,8 @@ type ReviewVerificationConfig struct {
 //	review:
 //	  verification:
 //	    runner:
-//	      wrapper: ["buildbox-run"]
+//	      wrapper: ["remote-run"]
+//	      cleanup: ["remote-run", "--cleanup"]
 //	      parallelism: 2
 //	      timeout: 10m
 type ReviewVerificationRunnerConfig struct {
@@ -1169,8 +1192,11 @@ type ReviewVerificationRunnerConfig struct {
 	// a remote build host over ssh) and is trusted to relay the real
 	// command's exit code. Empty keeps verification local.
 	// BUCKLEY_VERIFY_WRAPPER (shell-split, for example
-	// "buildbox-run --node-modules").
+	// "remote-run --node-modules").
 	Wrapper []string `yaml:"wrapper"`
+	// Cleanup runs `<cleanup...> <snapshot-dir>` once after all verification
+	// commands for that snapshot finish. Empty disables remote cleanup.
+	Cleanup []string `yaml:"cleanup"`
 	// Parallelism caps concurrent verification commands (batched remote
 	// invocations when Wrapper is set, or individual local commands
 	// otherwise). Zero uses the default: min(4, max(1, NumCPU/4)) locally,

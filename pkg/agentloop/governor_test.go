@@ -1,6 +1,7 @@
 package agentloop
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -63,7 +64,7 @@ func TestGovernorAllowsRepeatedPollingWhenEvidenceChanges(t *testing.T) {
 	}
 }
 
-func TestGovernorDetectsRepeatedOutcomeWithChangingArguments(t *testing.T) {
+func TestGovernor_AllowsFailedReadsWithDifferentArguments(t *testing.T) {
 	config := DefaultConfig()
 	config.ExactRepeatLimit = 20
 	config.CycleRepeats = 10
@@ -74,8 +75,8 @@ func TestGovernorDetectsRepeatedOutcomeWithChangingArguments(t *testing.T) {
 	for _, path := range []string{"a.go", "b.go", "c.go", "d.go"} {
 		decision = governor.Observe("read_file", `{"path":"`+path+`"}`, "not found", false)
 	}
-	if !decision.Stop || decision.Kind != "outcome_repeat" {
-		t.Fatalf("decision = %+v, want outcome-repeat stop", decision)
+	if decision.Stop || decision.Nudge != "" {
+		t.Fatalf("decision = %+v, want independent attempts", decision)
 	}
 }
 
@@ -234,5 +235,16 @@ func TestGovernorEscalatesFromCreativeCheckpointToActionBoundary(t *testing.T) {
 	}
 	if got := governor.ObserveProgress("readonly", true, false, false); !got.Stop || got.Kind != "read_only_budget" {
 		t.Fatalf("limit = %+v, want deterministic stop", got)
+	}
+}
+
+func TestGovernorChangedArgumentsAfterValidationErrorAreNotExactRepeat(t *testing.T) {
+	g := New(Config{})
+	msg := "error: retry with only `edits`"
+	for i := 0; i < 5; i++ {
+		args := fmt.Sprintf(`{"path":"f","edits":[{"old_string":"a%d","new_string":"b"}]}`, i)
+		if d := g.Observe("edit_file", args, msg, false); d.Kind == "exact_repeat" {
+			t.Fatalf("call %d stopped: %+v", i, d)
+		}
 	}
 }

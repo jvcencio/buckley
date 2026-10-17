@@ -28,11 +28,12 @@ const (
 // HEAD and non-ignored untracked files. It emits no workspace contents and is
 // stable across repeated observations of the same state.
 func GitStateFingerprint(ctx context.Context, root string) (string, error) {
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, defaultFingerprintTimeout)
-		defer cancel()
-	}
+	return gitStateFingerprint(ctx, root, false)
+}
+
+func gitStateFingerprint(ctx context.Context, root string, contentOnly bool) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, fingerprintTimeout(root))
+	defer cancel()
 	topRaw, err := gitOutput(ctx, root, maxFingerprintPathBytes, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return "", fmt.Errorf("observe workspace root: %w", err)
@@ -47,12 +48,22 @@ func GitStateFingerprint(ctx context.Context, root string) (string, error) {
 		return "", fmt.Errorf("open workspace root: %w", err)
 	}
 	defer rootFS.Close()
+	hashManifest := func(manifest gitManifest) (string, error) {
+		if contentOnly {
+			// Staging, committing, and changing branches are not content edits.
+			manifest.head, manifest.unbornHeadRef, manifest.index = "", "", nil
+			paths := append([]string(nil), manifest.trackedPaths...)
+			manifest.trackedPaths = sortedUniquePaths(append(paths, manifest.untrackedPaths...))
+			manifest.untrackedPaths = nil
+		}
+		return hashGitManifest(ctx, rootFS, manifest)
+	}
 
 	manifest, err := gitFingerprintManifest(ctx, root)
 	if err != nil {
 		return "", err
 	}
-	first, err := hashGitManifest(ctx, rootFS, manifest)
+	first, err := hashManifest(manifest)
 	if err != nil {
 		return "", err
 	}
@@ -63,7 +74,7 @@ func GitStateFingerprint(ctx context.Context, root string) (string, error) {
 	if !manifest.equal(afterManifest) {
 		return "", fmt.Errorf("workspace git manifest changed during observation")
 	}
-	second, err := hashGitManifest(ctx, rootFS, afterManifest)
+	second, err := hashManifest(afterManifest)
 	if err != nil {
 		return "", err
 	}
@@ -472,12 +483,20 @@ type gitCommandResult struct {
 }
 
 func runGitCommand(ctx context.Context, root string, limit int64, args ...string) (gitCommandResult, error) {
+	return runGitCommandWithInput(ctx, root, limit, nil, args...)
+}
+
+func runGitCommandWithInput(ctx context.Context, root string, limit int64, input io.Reader, args ...string) (gitCommandResult, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", root}, args...)...)
+	cmd.Stdin = input
 	stdout := boundedBuffer{limit: limit}
 	stderr := boundedBuffer{limit: limit}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	if ctx.Err() != nil {
+		return gitCommandResult{}, fmt.Errorf("git %s: %w", args[0], ctx.Err())
+	}
 	if stdout.exceeded {
 		return gitCommandResult{}, fmt.Errorf("git %s output exceeds observation limit", args[0])
 	}

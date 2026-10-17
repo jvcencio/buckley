@@ -2,7 +2,9 @@ package oneshot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"reflect"
 	"strings"
@@ -40,6 +42,7 @@ const (
 //   - AgentDefinition -> one multi-turn tool agent (review)
 type Framework struct {
 	invoker              ToolInvoker
+	validationFallbacks  []func() (ToolInvoker, error)
 	agentRunner          AgentExecutor
 	approvalCriticRunner AgentExecutor
 	engine               *rules.Engine
@@ -79,6 +82,8 @@ type AgentExecutionOpts struct {
 	// each build/test command through this wrapper against a remote host
 	// instead of the local sandbox.
 	VerificationWrapper []string
+	// VerificationCleanup runs once when the materialized snapshot is released.
+	VerificationCleanup []string
 	// VerificationParallelism caps concurrent verification commands
 	// (batched remote invocations when VerificationWrapper is set, or
 	// individual local commands otherwise). Zero uses
@@ -104,6 +109,14 @@ func NewFramework(invoker ToolInvoker, engine *rules.Engine) *Framework {
 	}
 }
 
+// WithValidationFallbacks supplies models in configuration order. Each factory
+// is called only after a model retry still fails validation.
+func (f *Framework) WithValidationFallbacks(factories ...func() (ToolInvoker, error)) *Framework {
+	copy := *f
+	copy.validationFallbacks = factories
+	return &copy
+}
+
 // WithAgentRunner returns a copy of the framework with the given tool agent runner.
 // This enables execution of AgentDefinition-based commands (e.g., review).
 func (f *Framework) WithAgentRunner(runner AgentExecutor) *Framework {
@@ -112,6 +125,7 @@ func (f *Framework) WithAgentRunner(runner AgentExecutor) *Framework {
 		agentRunner:          runner,
 		approvalCriticRunner: f.approvalCriticRunner,
 		engine:               f.engine,
+		validationFallbacks:  f.validationFallbacks,
 	}
 }
 
@@ -123,6 +137,7 @@ func (f *Framework) WithApprovalCriticRunner(runner AgentExecutor) *Framework {
 		agentRunner:          f.agentRunner,
 		approvalCriticRunner: runner,
 		engine:               f.engine,
+		validationFallbacks:  f.validationFallbacks,
 	}
 }
 
@@ -220,8 +235,12 @@ func (f *Framework) Run(ctx context.Context, def Definition, opts RunOpts) (*Run
 	var lastErr error
 	var traceAttempts []transparency.TraceAttempt
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		result, trace, invokeErr := f.invoker.Invoke(ctx, systemPrompt, userPrompt, tool, audit)
+	invoker := f.invoker
+	fallbackIndex, modelAttempts := 0, 0
+	attemptLimit := maxRetries
+	for attempt := 0; attempt < attemptLimit; attempt++ {
+		modelAttempts++
+		result, trace, invokeErr := invoker.Invoke(ctx, systemPrompt, userPrompt, tool, audit)
 		if invokeErr != nil {
 			trace = traceWithErrorIfBlank(trace, invokeErr)
 		}
@@ -260,8 +279,43 @@ func (f *Framework) Run(ctx context.Context, def Definition, opts RunOpts) (*Run
 		}
 
 		// 5. Validate
-		if err := def.Validate(result.ToolCall.Arguments); err != nil {
+		validate := func(args json.RawMessage) error {
+			if err := def.Validate(args); err != nil {
+				return err
+			}
+			if pd, ok := def.(PolicyDefinition); ok && f.engine != nil {
+				handled, err := f.evalPolicy(pd, gathered, args)
+				if handled {
+					return err
+				}
+			}
+			if cv, ok := def.(ContextValidator); ok {
+				return cv.ValidateWithContext(gathered, args)
+			}
+			return nil
+		}
+		validationErr := validate(result.ToolCall.Arguments)
+		if validationErr != nil {
+			if repairer, ok := def.(RepairableDefinition); ok {
+				repaired, repairs := repairer.Repair(result.ToolCall.Arguments)
+				if len(repairs) > 0 && validate(repaired) == nil {
+					result.ToolCall.Arguments = repaired
+					validationErr = nil
+					for _, repair := range repairs {
+						slog.Info("repaired header: " + repair)
+					}
+				}
+			}
+		}
+		if err := validationErr; err != nil {
 			lastErr = fmt.Errorf("validation: %w", err)
+			if isTerminalValidation(err) {
+				if traceIndex >= 0 {
+					traceAttempts[traceIndex].ValidationError = strings.TrimSpace(lastErr.Error())
+				}
+				attemptLimit = attempt + 1
+				break
+			}
 			if traceIndex >= 0 {
 				traceAttempts[traceIndex].ValidationError = strings.TrimSpace(lastErr.Error())
 			}
@@ -270,10 +324,28 @@ func (f *Framework) Run(ctx context.Context, def Definition, opts RunOpts) (*Run
 			// Echoing its own previous tool call arguments turns this into a
 			// targeted repair -- fix exactly this field in exactly this
 			// payload -- instead of a fresh, possibly-repeated guess.
-			userPrompt = baseUserPrompt + "\n\nThe previous response failed validation: " + strings.TrimSpace(err.Error()) +
-				".\n\nYour previous " + tool.Name + " call arguments were:\n```json\n" +
-				truncateForTrace(string(result.ToolCall.Arguments), validationRepairArgumentsMaxLen) +
-				"\n```\n\nFix the issue named above and call " + tool.Name + " again with corrected arguments."
+			if sensitiveValidation(err) {
+				// The rejected arguments may hold private text; do not echo them.
+				userPrompt = baseUserPrompt + "\n\nThe previous response failed validation: " + strings.TrimSpace(err.Error()) +
+					".\n\nCall " + tool.Name + " again with corrected arguments."
+			} else {
+				userPrompt = baseUserPrompt + "\n\nThe previous response failed validation: " + strings.TrimSpace(err.Error()) +
+					".\n\nYour previous " + tool.Name + " call arguments were:\n```json\n" +
+					truncateForTrace(string(result.ToolCall.Arguments), validationRepairArgumentsMaxLen) +
+					"\n```\n\nFix the issue named above and call " + tool.Name + " again with corrected arguments."
+			}
+			if modelAttempts >= min(2, maxRetries) && fallbackIndex < len(f.validationFallbacks) {
+				next, fallbackErr := f.validationFallbacks[fallbackIndex]()
+				fallbackIndex++
+				if fallbackErr != nil {
+					lastErr = fmt.Errorf("validation fallback: %w", fallbackErr)
+					attemptLimit = attempt + 1
+					break
+				}
+				invoker = next
+				modelAttempts = 0
+				attemptLimit = attempt + 1 + maxRetries
+			}
 			continue
 		}
 
@@ -309,24 +381,24 @@ func (f *Framework) Run(ctx context.Context, def Definition, opts RunOpts) (*Run
 	// guess whether the model skipped the tool call, tripped validation,
 	// or emitted malformed JSON.
 	if lastErr != nil {
-		err := fmt.Errorf("failed after %d attempts for command %q: last attempt: %w", maxRetries, def.Name(), lastErr)
+		err := fmt.Errorf("failed after %d attempts for command %q: last attempt: %w", attemptLimit, def.Name(), lastErr)
 		retainedTrace := traceWithErrorIfBlank(aggregateDefinitionTrace(traceAttempts, lastTrace), err)
 		return &RunResult{
 			Trace:            retainedTrace,
 			ContextAudit:     audit,
-			Attempts:         maxRetries,
-			PrimaryAttempts:  maxRetries,
+			Attempts:         attemptLimit,
+			PrimaryAttempts:  attemptLimit,
 			Incomplete:       true,
 			IncompleteReason: err.Error(),
 		}, err
 	}
-	err = fmt.Errorf("failed after %d attempts for command %q", maxRetries, def.Name())
+	err = fmt.Errorf("failed after %d attempts for command %q", attemptLimit, def.Name())
 	retainedTrace := traceWithErrorIfBlank(aggregateDefinitionTrace(traceAttempts, lastTrace), err)
 	return &RunResult{
 		Trace:            retainedTrace,
 		ContextAudit:     audit,
-		Attempts:         maxRetries,
-		PrimaryAttempts:  maxRetries,
+		Attempts:         attemptLimit,
+		PrimaryAttempts:  attemptLimit,
 		Incomplete:       true,
 		IncompleteReason: err.Error(),
 	}, err
@@ -412,6 +484,8 @@ type AgentRunOpts struct {
 	// snapshot verification command through a remote wrapper instead of the
 	// local sandbox. Empty keeps verification local.
 	VerificationWrapper []string
+	// VerificationCleanup runs once when the materialized snapshot is released.
+	VerificationCleanup []string
 
 	// VerificationParallelism caps concurrent verification commands. Zero
 	// uses reviewsandbox.DefaultLocalParallelism().
@@ -501,6 +575,7 @@ func (f *Framework) RunAgent(ctx context.Context, def AgentDefinition, opts Agen
 		SynthesisLead:           opts.SynthesisLead,
 		VerificationTimeout:     opts.VerificationTimeout,
 		VerificationWrapper:     opts.VerificationWrapper,
+		VerificationCleanup:     opts.VerificationCleanup,
 		VerificationParallelism: opts.VerificationParallelism,
 		ModelID:                 opts.ModelID,
 		ReasoningEffort:         opts.ReasoningEffort,
@@ -1113,4 +1188,28 @@ func (f *Framework) resolveMaxRetries(cmdName string, optsRetries int) int {
 	}
 
 	return defaultMaxRetries
+}
+
+// evalPolicy runs the definition's policy strategy. It reports handled=false
+// when the engine cannot evaluate it, so the caller falls back to its own check.
+func (f *Framework) evalPolicy(pd PolicyDefinition, gathered *Context, args json.RawMessage) (bool, error) {
+	req, err := pd.PolicyFacts(gathered, args)
+	if err != nil || req == nil {
+		return false, nil
+	}
+	res, err := f.engine.EvalStrategy(req.Domain, req.Strategy, req.Facts)
+	if err != nil {
+		return false, nil
+	}
+	action, _ := res.Params["action"].(string)
+	reason, _ := res.Params["reason"].(string)
+	switch action {
+	case "allow":
+		return true, nil
+	case "repair":
+		return true, req.Fail(action, reason)
+	case "block":
+		return true, terminalValidationError{req.Fail(action, reason)}
+	}
+	return false, nil
 }

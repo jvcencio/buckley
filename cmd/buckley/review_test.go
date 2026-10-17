@@ -575,7 +575,7 @@ func TestReviewResultFromAgentExposesPrimaryAndCriticAttempts(t *testing.T) {
 		t.Fatalf("host evidence = %d total/%d passed/%d not applicable, want 3/1/1",
 			got.hostEvidence, got.hostPasses, got.hostNotApplicable)
 	}
-	if summary := reviewHostEvidenceSummary(got); summary != "Harness verification: 1 passed · 1 not applicable · 1 failed or unavailable · 3 total" {
+	if summary := reviewHostEvidenceSummary(got); summary != "Harness verification: 1 passed · 1 not applicable · 0 failed · 1 unavailable · 3 total" {
 		t.Fatalf("host evidence summary = %q", summary)
 	}
 }
@@ -738,5 +738,18 @@ func TestReviewCommandFailureDiscardsIncompleteReview(t *testing.T) {
 	}
 	if err := reviewCommandFailure(sentinel, &reviewCommandResult{}); !errors.Is(err, sentinel) || err.Error() != sentinel.Error() {
 		t.Fatalf("complete failure = %v, want original error", err)
+	}
+}
+
+func TestReviewResultFromAgent_LowDiskInfrastructureText(t *testing.T) {
+	call := oneshot.AgentToolCall{Name: "run_verification", Error: "remote build host low on disk (wrapper exit 91); infrastructure failure, verification unavailable", Data: map[string]any{"status": "UNAVAILABLE", "evidence": "INCONCLUSIVE"}}
+	for _, incomplete := range []bool{false, true} {
+		result := reviewResultFromAgent(&oneshot.RunResult{ToolEvidence: []oneshot.AgentToolCall{call}, Incomplete: incomplete}, nil)
+		if !strings.Contains(result.reviewText, "remote build host low on disk") || !strings.Contains(result.reviewText, "Infrastructure failure") {
+			t.Fatalf("review omits infrastructure failure: %s", result.reviewText)
+		}
+		if got := reviewEvidencePresentationStatus(call); !strings.HasPrefix(got, "INCONCLUSIVE") {
+			t.Fatalf("status: %s", got)
+		}
 	}
 }

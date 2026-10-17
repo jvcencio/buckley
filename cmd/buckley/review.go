@@ -34,6 +34,7 @@ type reviewCommandOptions struct {
 	verbose         bool
 	showCost        bool
 	model           string
+	effort          string
 	criticModel     string
 	timeout         time.Duration
 	outputFile      string
@@ -59,6 +60,9 @@ type reviewCommandRuntime struct {
 }
 
 type reviewCommandResult struct {
+	snapshot          *model.ReviewSnapshot
+	baseSHA           string
+	reviewRef         string
 	reviewText        string
 	parsed            *commands.ParsedReview
 	trace             *transparency.Trace
@@ -68,6 +72,7 @@ type reviewCommandResult struct {
 	criticAttempts    int
 	hostEvidence      int
 	hostPasses        int
+	hostFailures      int
 	hostNotApplicable int
 	toolEvidence      []oneshot.AgentToolCall
 	commandEvidence   []model.CommandExecutionEvidence
@@ -111,6 +116,7 @@ func parseReviewCommandOptions(args []string) (reviewCommandOptions, error) {
 	verbose := fs.Bool("verbose", false, "show full context and reasoning")
 	showCost := fs.Bool("cost", true, "show token/cost breakdown")
 	modelFlag := fs.String("model", "", "model to use; codex/auto scales Luna to Terra to Sol")
+	effortFlag := fs.String("effort", "", "reasoning effort: low, medium, high, xhigh, or max (default: BUCKLEY_EFFORT_REVIEW, BUCKLEY_ONESHOT_EFFORT, or config)")
 	criticModel := fs.String("critic-model", "", "opt-in approval critic model for large or business-critical reviews")
 	timeout := fs.Duration("timeout", defaultReviewTimeout, "total review timeout (project reviews default to 20m)")
 	outputFile := fs.String("output", "", "write review to file instead of stdout")
@@ -126,6 +132,10 @@ func parseReviewCommandOptions(args []string) (reviewCommandOptions, error) {
 	inDepth := fs.Bool("in-depth", false, "alias for --depth in-depth")
 
 	if err := fs.Parse(args); err != nil {
+		return reviewCommandOptions{}, err
+	}
+	effort, err := resolveOneshotEffort("review", *effortFlag)
+	if err != nil {
 		return reviewCommandOptions{}, err
 	}
 	timeoutWasSet := false
@@ -175,6 +185,7 @@ func parseReviewCommandOptions(args []string) (reviewCommandOptions, error) {
 		verbose:         *verbose,
 		showCost:        *showCost,
 		model:           *modelFlag,
+		effort:          effort,
 		criticModel:     *criticModel,
 		timeout:         *timeout,
 		outputFile:      *outputFile,
@@ -197,7 +208,11 @@ func parseReviewCommandOptions(args []string) (reviewCommandOptions, error) {
 }
 
 // runReviewCommand performs code review on a branch or project.
-func runReviewCommand(args []string) error {
+func runReviewCommand(args []string) (returnErr error) {
+	started := time.Now()
+	if len(args) > 0 && args[0] == "ledger" {
+		return runReviewLedgerCommand(args[1:])
+	}
 	sweepStaleReviewWorkspaces()
 
 	opts, err := parseReviewCommandOptions(args)
@@ -218,10 +233,20 @@ func runReviewCommand(args []string) error {
 	if store != nil {
 		defer store.Close()
 	}
+	archive := configuredReviewLedger(cfg)
+	retryReviewLedger(archive)
+	var result *reviewCommandResult
+	if archive != nil {
+		record := reviewLedgerIdentity(started, "", opts.baseBranch, resolveReviewModel(cfg))
+		if opts.projectMode {
+			record.BaseSHA = ""
+		}
+		defer func() { finishReviewLedger(archive, record, result, nil, returnErr) }()
+	}
 	if err != nil {
 		return fmt.Errorf("init dependencies: %w", err)
 	}
-	runtime, err := newReviewCommandRuntime(ctx, cfg, mgr, store)
+	runtime, err := newReviewCommandRuntime(ctx, cfg, mgr, store, opts.effort)
 	if err != nil {
 		return fmt.Errorf("initialize review runtime: %w", err)
 	}
@@ -252,7 +277,8 @@ func runReviewCommand(args []string) error {
 		clearCostBudget:       opts.noBudget,
 		depth:                 opts.depth,
 	})
-	result, reviewErr := runReviewWithPolicy(ctx, opts, runtime.framework, policy)
+	var reviewErr error
+	result, reviewErr = runReviewWithPolicy(ctx, opts, runtime.framework, policy)
 
 	if opts.verbose && result != nil && result.contextAudit != nil {
 		printReviewContextAudit(result.contextAudit)
@@ -362,8 +388,8 @@ func applyReviewCriticModelOverride(cfg *config.Config, modelID string) {
 	cfg.Providers.Codex.Models = append(cfg.Providers.Codex.Models, normalized)
 }
 
-func newReviewCommandRuntime(ctx context.Context, cfg *config.Config, mgr *model.Manager, store *storage.Store) (*reviewCommandRuntime, error) {
-	modelID := resolveReviewModel(cfg)
+func newReviewCommandRuntime(ctx context.Context, cfg *config.Config, mgr *model.Manager, store *storage.Store, effort string) (*reviewCommandRuntime, error) {
+	modelID, cfg := resolveOneshotModelWithEffort(cfg, effort, resolveReviewModel)
 	if modelID == "" {
 		return nil, fmt.Errorf("no review model configured")
 	}
@@ -374,7 +400,11 @@ func newReviewCommandRuntime(ctx context.Context, cfg *config.Config, mgr *model
 	if err := mgr.SetOpenRouterPrivacyFallback(privacyFallback); err != nil {
 		return nil, fmt.Errorf("configure OpenRouter privacy fallback: %w", err)
 	}
-	reasoningEffort := resolveReviewReasoningEffort(ctx, cfg, mgr, modelID, reviewReasoningOverride())
+	explicitReasoning := effort
+	if explicitReasoning == "" {
+		explicitReasoning = reviewReasoningOverride()
+	}
+	reasoningEffort := resolveReviewReasoningEffort(ctx, cfg, mgr, modelID, explicitReasoning)
 	arbEngine, err := rules.NewDefaultEngine()
 	if err != nil {
 		return nil, fmt.Errorf("initialize rules engine: %w", err)
@@ -410,8 +440,11 @@ func newReviewCommandRuntime(ctx context.Context, cfg *config.Config, mgr *model
 	policy.modelID = modelID
 	policy.adaptiveCodexModel = isAdaptiveCodexReviewSelector(resolveReviewModelSelector(cfg))
 	policy.reasoningEffort = reasoningEffort
-	policy.adaptiveReasoning = reviewReasoningIsAdaptive(cfg, reviewReasoningOverride())
+	policy.adaptiveReasoning = reviewReasoningIsAdaptive(cfg, explicitReasoning)
 	policy.engine = arbEngine
+	if effort != "" {
+		policy.decisionsGate.forceFullDepth = true
+	}
 	if behavior, found, err := reviewBehaviorProfile(cfg, mgr, store, modelID, policy.adaptiveCodexModel); err != nil {
 		_ = registry.Close()
 		if durableCleanup != nil {
@@ -553,7 +586,7 @@ func runReviewWithPolicy(ctx context.Context, opts reviewCommandOptions, framewo
 	return runBranchReviewWithPolicy(ctx, opts, framework, policy)
 }
 
-func runProjectReviewWithPolicy(ctx context.Context, framework *oneshot.Framework, reviewPolicy automatedReviewOptions) (*reviewCommandResult, error) {
+func runProjectReviewWithPolicy(ctx context.Context, framework *oneshot.Framework, reviewPolicy automatedReviewOptions) (result *reviewCommandResult, reviewErr error) {
 	spinner := newReviewProgress("Analyzing project...")
 	spinner.Start()
 	policy := model.ReviewSnapshotPolicy{
@@ -574,6 +607,12 @@ func runProjectReviewWithPolicy(ctx context.Context, framework *oneshot.Framewor
 		spinner.StopWithError(err.Error())
 		return nil, fmt.Errorf("assemble context: %w", err)
 	}
+	defer func() {
+		if result != nil {
+			result.snapshot = snapshot
+			result.reviewRef = projectCtx.Branch
+		}
+	}()
 	if snapshot == nil || snapshot.Commit() != projectCtx.HeadCommit {
 		err := fmt.Errorf("project review context does not match the captured immutable HEAD")
 		spinner.StopWithError(err.Error())
@@ -625,6 +664,7 @@ func runProjectReviewWithPolicy(ctx context.Context, framework *oneshot.Framewor
 		SynthesisLead:            reviewPolicy.synthesisLead,
 		VerificationTimeout:      reviewPolicy.verificationTimeout,
 		VerificationWrapper:      reviewPolicy.verificationWrapper,
+		VerificationCleanup:      reviewPolicy.verificationCleanup,
 		VerificationParallelism:  reviewPolicy.verificationParallelism,
 		ModelID:                  reviewPolicy.modelID,
 		ReasoningEffort:          reviewPolicy.reasoningEffort,
@@ -646,7 +686,7 @@ func runProjectReviewWithPolicy(ctx context.Context, framework *oneshot.Framewor
 	return reviewResultFromAgent(fwResult, audit), nil
 }
 
-func runBranchReviewWithPolicy(ctx context.Context, opts reviewCommandOptions, framework *oneshot.Framework, reviewPolicy automatedReviewOptions) (*reviewCommandResult, error) {
+func runBranchReviewWithPolicy(ctx context.Context, opts reviewCommandOptions, framework *oneshot.Framework, reviewPolicy automatedReviewOptions) (result *reviewCommandResult, reviewErr error) {
 	reviewScope := normalizeReviewCommandScope(opts.scope)
 	spinner := newReviewProgress(fmt.Sprintf("Analyzing %s changes...", reviewScope))
 	spinner.Start()
@@ -679,6 +719,13 @@ func runBranchReviewWithPolicy(ctx context.Context, opts reviewCommandOptions, f
 		spinner.StopWithError(err.Error())
 		return nil, fmt.Errorf("assemble context: %w", err)
 	}
+	defer func() {
+		if result != nil {
+			result.snapshot = snapshot
+			result.baseSHA = branchCtx.BaseCommit
+			result.reviewRef = branchCtx.Branch
+		}
+	}()
 	if snapshot == nil || snapshot.Commit() != branchCtx.HeadCommit {
 		err := fmt.Errorf("branch review context does not match the captured immutable HEAD")
 		spinner.StopWithError(err.Error())
@@ -727,6 +774,7 @@ func runBranchReviewWithPolicy(ctx context.Context, opts reviewCommandOptions, f
 		SynthesisLead:            reviewPolicy.synthesisLead,
 		VerificationTimeout:      reviewPolicy.verificationTimeout,
 		VerificationWrapper:      reviewPolicy.verificationWrapper,
+		VerificationCleanup:      reviewPolicy.verificationCleanup,
 		VerificationParallelism:  reviewPolicy.verificationParallelism,
 		ModelID:                  reviewPolicy.modelID,
 		ReasoningEffort:          reviewPolicy.reasoningEffort,
@@ -801,6 +849,9 @@ func reviewResultFromAgent(fwResult *oneshot.RunResult, audit *transparency.Cont
 	result.criticAttempts = fwResult.CriticAttempts
 	result.hostEvidence = len(fwResult.HostEvidence)
 	for _, call := range fwResult.HostEvidence {
+		if status, _ := call.Data["status"].(string); !call.Success && strings.EqualFold(status, "FAIL") {
+			result.hostFailures++
+		}
 		switch reviewEvidencePresentationStatus(call) {
 		case "PASS":
 			result.hostPasses++
@@ -810,6 +861,7 @@ func reviewResultFromAgent(fwResult *oneshot.RunResult, audit *transparency.Cont
 	}
 	result.toolEvidence = append([]oneshot.AgentToolCall(nil), fwResult.ToolEvidence...)
 	result.commandEvidence = append([]model.CommandExecutionEvidence(nil), fwResult.CommandEvidence...)
+	result.reviewText = appendReviewInfrastructureDiagnostics(result.reviewText, result.toolEvidence)
 	result.incomplete = fwResult.Incomplete
 	result.incompleteWhy = fwResult.IncompleteReason
 	if result.incomplete {
@@ -819,6 +871,16 @@ func reviewResultFromAgent(fwResult *oneshot.RunResult, audit *transparency.Cont
 		result.parsed = nil
 	}
 	return result
+}
+
+func appendReviewInfrastructureDiagnostics(review string, calls []oneshot.AgentToolCall) string {
+	for _, call := range calls {
+		reason, _ := call.Data["error"].(string)
+		if strings.Contains(call.Error+reason, "remote build host low on disk") {
+			return strings.TrimSpace(review) + "\n\nInfrastructure failure: remote build host low on disk. Verification is inconclusive; this does not prove a product defect."
+		}
+	}
+	return review
 }
 
 func appendReviewEvidenceDiagnostics(review string, toolCalls []oneshot.AgentToolCall, commands []model.CommandExecutionEvidence) string {
@@ -839,6 +901,9 @@ func appendReviewEvidenceDiagnostics(review string, toolCalls []oneshot.AgentToo
 		}
 		if output := reviewAttemptExcerpt(call.Result, 3000); output != "" {
 			fmt.Fprintf(&b, "\n  - Result: `%s`", strings.ReplaceAll(strings.ReplaceAll(output, "`", "'"), "\n", " "))
+		}
+		if call.Error != "" {
+			fmt.Fprintf(&b, "\n  - Error: %s", reviewAttemptExcerpt(call.Error, 1000))
 		}
 		b.WriteString("\n")
 	}
@@ -873,6 +938,9 @@ func reviewEvidencePresentationStatus(call oneshot.AgentToolCall) string {
 	}
 	if call.Success {
 		return "PASS"
+	}
+	if status == "UNAVAILABLE" {
+		return "INCONCLUSIVE (infrastructure or verification unavailable)"
 	}
 	return "FAILED_OR_UNAVAILABLE"
 }
@@ -991,15 +1059,13 @@ func reviewHostEvidenceSummary(result *reviewCommandResult) string {
 	if result == nil || result.hostEvidence <= 0 {
 		return ""
 	}
-	failedOrUnavailable := result.hostEvidence - result.hostPasses - result.hostNotApplicable
-	if failedOrUnavailable < 0 {
-		failedOrUnavailable = 0
-	}
+	unavailable := max(0, result.hostEvidence-result.hostPasses-result.hostNotApplicable-result.hostFailures)
 	return fmt.Sprintf(
-		"Harness verification: %d passed · %d not applicable · %d failed or unavailable · %d total",
+		"Harness verification: %d passed · %d not applicable · %d failed · %d unavailable · %d total",
 		result.hostPasses,
 		result.hostNotApplicable,
-		failedOrUnavailable,
+		result.hostFailures,
+		unavailable,
 		result.hostEvidence,
 	)
 }

@@ -14,6 +14,7 @@ import (
 	"m31labs.dev/buckley/pkg/model"
 	"m31labs.dev/buckley/pkg/modelusage"
 	"m31labs.dev/buckley/pkg/prompts"
+	"m31labs.dev/buckley/pkg/reviewsandbox"
 	"m31labs.dev/buckley/pkg/rlm"
 	"m31labs.dev/buckley/pkg/runledger"
 	"m31labs.dev/buckley/pkg/tool"
@@ -161,11 +162,12 @@ func (r *AgentRunner) Run(ctx context.Context, systemPrompt, task string, allowe
 			if err != nil {
 				return nil, fmt.Errorf("materialize API review snapshot: %w", err)
 			}
+			defer cleanupSnapshot()
 			snapshotRoot, rootErr := model.ReviewWorkspaceRepositoryRoot(ctx, snapshotWorkDir)
 			if rootErr != nil {
-				cleanupSnapshot()
 				return nil, fmt.Errorf("resolve API review snapshot root: %w", rootErr)
 			}
+			defer reviewsandbox.CleanupSnapshot(opts.VerificationCleanup, snapshotRoot)
 			agentRegistry, err = newReviewSnapshotRegistryWithLimits(
 				snapshotRoot,
 				opts.ReviewSnapshot.RepositoryRoot(),
@@ -175,13 +177,11 @@ func (r *AgentRunner) Run(ctx context.Context, systemPrompt, task string, allowe
 				r.models.ReviewSandboxCommand(),
 			)
 			if err != nil {
-				cleanupSnapshot()
 				return nil, err
 			}
 			if reviewToolAllowed(allowedTools, "exec_program") && r.runLedger != nil && r.evidence != nil && execmode.DetectIsolation() == execmode.IsolationBwrap {
 				reviewCodeModeRunID, err = registerReviewCodeModeTool(ctx, agentRegistry, snapshotRoot, r.runLedger, r.evidence, traceID, modelToUse, providerID)
 				if err != nil {
-					cleanupSnapshot()
 					_ = agentRegistry.Close()
 					return nil, fmt.Errorf("enable review code mode: %w", err)
 				}
@@ -189,7 +189,6 @@ func (r *AgentRunner) Run(ctx context.Context, systemPrompt, task string, allowe
 			closeAgentRegistry = true
 		}
 	}
-	defer cleanupSnapshot()
 	if reviewCodeModeRunID != "" {
 		defer func() {
 			_ = r.runLedger.EndRun(context.Background(), reviewCodeModeRunID, reviewCodeModeStatus, time.Now().UTC(), map[string]any{
@@ -314,21 +313,23 @@ func (r *AgentRunner) Run(ctx context.Context, systemPrompt, task string, allowe
 
 	// Calculate API cost only when the provider publishes token pricing.
 	// Native Codex runs through the user's CLI subscription.
-	cost, costUnknown := agentRunnerInvocationCost(r.models, providerID, modelToUse, tokens)
+	cost, costUnknown, costEstimated := agentRunnerInvocationCostDetail(r.models, providerID, modelToUse, tokens)
 
 	result.Trace = builder.Complete(tokens, cost)
 	result.Trace.CostUnknown = costUnknown
+	result.Trace.CostEstimated = costEstimated
 	result.Trace.Duration = duration
 
 	// Record in ledger
 	if r.ledger != nil {
 		r.ledger.Record(transparency.CostEntry{
-			Model:        modelToUse,
-			Tokens:       tokens,
-			Cost:         cost,
-			CostUnknown:  costUnknown,
-			Latency:      duration,
-			InvocationID: traceID,
+			Model:         modelToUse,
+			Tokens:        tokens,
+			Cost:          cost,
+			CostUnknown:   costUnknown,
+			CostEstimated: costEstimated,
+			Latency:       duration,
+			InvocationID:  traceID,
 		})
 	}
 
@@ -427,6 +428,8 @@ func (r *AgentRunner) CollectAgentEvidence(ctx context.Context, requests []Agent
 	if err != nil {
 		return nil, fmt.Errorf("resolve agent evidence snapshot root: %w", err)
 	}
+
+	defer reviewsandbox.CleanupSnapshot(opts.VerificationCleanup, root)
 
 	allowedTools := make([]string, 0, len(requests))
 	seenTools := make(map[string]struct{}, len(requests))
@@ -615,22 +618,77 @@ func effectiveAgentInvocationCost(providerID string, pricing transparency.ModelP
 	return pricing.Calculate(tokens)
 }
 
-func agentRunnerInvocationCost(models *model.Manager, providerID, modelID string, tokens transparency.TokenUsage) (float64, bool) {
+// agentRunnerInvocationCostDetail prices one agent invocation. The third result
+// reports that the cost is an estimate from token counts and catalog prices,
+// used when the provider reports no cost (for example a BYOK route) and the
+// strict catalog price check cannot vouch for the price.
+func agentRunnerInvocationCostDetail(models *model.Manager, providerID, modelID string, tokens transparency.TokenUsage) (float64, bool, bool) {
 	if providerID == "codex" {
-		return 0, false
+		return 0, false, false
+	}
+	// A BYOK response that reports $0 has not reported the upstream charge, so
+	// only a positive provider figure counts as reported; zero falls through to
+	// the catalog estimate.
+	if tokens.ProviderCostKnown && tokens.ProviderCostIsBYOK && tokens.ProviderCostUSD > 0 {
+		return tokens.ProviderCostUSD, false, false
 	}
 	if models == nil {
-		return 0, true
+		return 0, true, false
 	}
 	info, err := models.GetModelInfo(modelID)
-	if err != nil || info == nil || !info.PricingKnown {
-		return 0, true
+	if err != nil || info == nil {
+		return 0, true, false
 	}
-	pricing := transparency.ModelPricing{
-		InputPerMillion:  info.Pricing.Prompt,
-		OutputPerMillion: info.Pricing.Completion,
+	if info.PricingKnown {
+		pricing := transparency.ModelPricing{
+			InputPerMillion:  info.Pricing.Prompt,
+			OutputPerMillion: info.Pricing.Completion,
+		}
+		if !transparency.CostUnknownForUsage(tokens, pricing) {
+			return effectiveAgentInvocationCost(providerID, pricing, tokens), false, false
+		}
 	}
-	return effectiveAgentInvocationCost(providerID, pricing, tokens), transparency.CostUnknownForUsage(tokens, pricing)
+	if cost, ok := estimateAgentInvocationCost(*info, tokens); ok {
+		return cost, false, true
+	}
+	return 0, true, false
+}
+
+// estimateAgentInvocationCost prices tokens from catalog rates. It refuses
+// usage records whose counts are themselves unreliable.
+func estimateAgentInvocationCost(info model.ModelInfo, tokens transparency.TokenUsage) (float64, bool) {
+	if tokens.Estimated || tokens.Unclassified > 0 || tokens.ReportedUsageInconsistent || tokens.UsageEvidenceMissing {
+		return 0, false
+	}
+	if tokens.Input < 0 || tokens.Output < 0 || tokens.Reasoning < 0 || tokens.CachedInput < 0 || tokens.ReportedCacheWrite < 0 {
+		return 0, false
+	}
+	rates, ok := info.EstimateRates(tokens.Input)
+	if !ok {
+		return 0, false
+	}
+	cached := tokens.CachedInput
+	if tokens.ReportedCachedInput != nil {
+		cached = *tokens.ReportedCachedInput
+	}
+	if cached < 0 || cached > tokens.Input {
+		return 0, false
+	}
+	write := tokens.ReportedCacheWrite
+	if cached+write > tokens.Input {
+		write = tokens.Input - cached
+	}
+	cacheReadRate, cacheWriteRate := rates.CacheRead, rates.CacheWrite
+	if cacheReadRate == 0 {
+		cacheReadRate = rates.Prompt
+	}
+	if cacheWriteRate == 0 {
+		cacheWriteRate = rates.Prompt
+	}
+	fresh := tokens.Input - cached - write
+	total := float64(fresh)*rates.Prompt + float64(cached)*cacheReadRate + float64(write)*cacheWriteRate +
+		float64(tokens.Output+tokens.Reasoning)*rates.Completion
+	return total / 1_000_000, true
 }
 
 func agentResultTokenUsage(result *AgentResult) transparency.TokenUsage {
@@ -766,7 +824,7 @@ func newReviewSnapshotRegistryWithLimits(root, sourceRoot string, allowedTools [
 
 func normalizeAgentReasoningEffort(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "minimal", "low", "medium", "high", "xhigh":
+	case "minimal", "low", "medium", "high", "xhigh", "max":
 		return strings.ToLower(strings.TrimSpace(effort))
 	default:
 		return ""

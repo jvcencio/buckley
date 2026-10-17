@@ -90,6 +90,14 @@ type controllerTotals struct {
 	progress                 ProgressSnapshot
 	startedAt                time.Time
 	completionRepairAttempts int
+	continuations            int
+	noChangeContinuations    int
+	// verificationContinuations counts continuations rejected for missing or
+	// failed post-change verification.
+	verificationContinuations int
+	// noCheckConfirmations counts the times the model was asked whether its
+	// work is finished because the workspace has no check at all.
+	noCheckConfirmations int
 }
 
 // RequestBuilder returns the base chat request for one round. Its Messages
@@ -199,14 +207,23 @@ type ToolOutcome struct {
 	// observation policy around this call. StateChanged is the resulting
 	// verdict. These are deliberately separate from EffectClass: permissions
 	// describe what a tool may do, while progress describes what it did.
-	StateObserved          bool
-	StateChanged           bool
+	StateObserved bool
+	StateChanged  bool
+	// StateFingerprint binds verification to the observed post-tool state.
+	StateFingerprint       string
 	StateObservationFailed bool
 	StateObservationError  string
 	// VerificationObserved reports that this outcome is a verification/check
 	// result. VerificationPassed is the typed pass/fail result.
 	VerificationObserved bool
 	VerificationPassed   bool
+	// VerificationUnavailable reports that a verification tool could not run
+	// its check: the call was refused before launch, or the workspace has
+	// nothing for it to run. Such an outcome holds no pass or fail evidence,
+	// so it is never VerificationObserved and never replaces the last
+	// verification result. The reason is a short plain sentence.
+	VerificationUnavailable       bool
+	VerificationUnavailableReason string
 	// EvidenceID optionally links this outcome to a durable evidence object.
 	// Verification passes that clear completion debt should provide one.
 	EvidenceID string `json:"-"`
@@ -367,10 +384,24 @@ type Termination struct {
 	ProviderError         string
 }
 
+// StopReason exposes harness-generated detail without disclosing provider
+// errors or rejected output carried by other termination reasons.
+func (t Termination) StopReason() string {
+	switch t.Kind {
+	case "exact_repeat", "outcome_repeat", "action_cycle", "read_only_budget", "round_limit", "tool_call_limit", "step_cap", "model_request_limit", "emergency_fuse",
+		TerminationCompletedUnverified, TerminationVerificationStalled:
+		if t.Reason != "" {
+			return t.Kind + ": " + t.Reason
+		}
+	}
+	return t.Kind
+}
+
 // IncompleteTurnError reports that Buckley preserved the turn's evidence but
 // could not produce a conclusive terminal answer from it.
 type IncompleteTurnError struct {
 	FinishReason      string
+	StopReason        string
 	Code              string
 	Reason            string
 	FinalizationError string
@@ -472,6 +503,7 @@ func (r *Result) RequireConclusive() error {
 	}
 	return &IncompleteTurnError{
 		FinishReason:      r.FinishReason,
+		StopReason:        r.Termination.StopReason(),
 		Code:              r.Termination.Code,
 		Reason:            r.Termination.Reason,
 		FinalizationError: r.Termination.FinalizationError,
@@ -488,6 +520,8 @@ type DurableStepJournal interface {
 
 // ControllerConfig wires one Controller instance.
 type ControllerConfig struct {
+	// OnStop reports the original intervention before final synthesis starts.
+	OnStop func(Termination)
 	// Governor is consulted at the start of every round (BeginRound) and
 	// after every dispatched tool call (Observe). Optional; when nil,
 	// Controller uses New(DefaultConfig()).
@@ -696,6 +730,9 @@ func (c *Controller) Run(ctx context.Context) (result *Result, runErr error) {
 	progress := progressTracker{snapshot: c.totals.progress}
 	contract, contractEnabled := c.completionContract()
 	defer func() {
+		if result.Termination.Kind != "" && !result.Termination.FinalizationAttempted && c.cfg.OnStop != nil {
+			c.cfg.OnStop(result.Termination)
+		}
 		result.Progress = progress.Snapshot()
 		c.totals.usage = cloneControllerUsage(result.Usage)
 		c.totals.costUSD = result.CostUSD
@@ -922,10 +959,80 @@ func (c *Controller) Run(ctx context.Context) (result *Result, runErr error) {
 			result.Message = msg
 			result.Content = text
 			if contractEnabled {
+				if contract.MaxContinuations > 0 {
+					if blocked, ok := parseBlockedResult(text); ok {
+						result.CompletionStatus = CompletionIncomplete
+						result.Termination = Termination{Kind: "blocked", Code: "blocked", Reason: blocked.Reason + "; human input: " + blocked.RequiredInput}
+						c.recordDecision(ctx, "blocked", result.Termination.Reason)
+						if c.cfg.History != nil {
+							c.cfg.History.Append(msg)
+						}
+						return result, result.RequireConclusive()
+					}
+				}
 				if err := contract.evaluateFinalResponse(progress.Snapshot(), text); err != nil {
 					result.CompletionStatus = CompletionIncomplete
 					result.Termination = Termination{Kind: "completion_contract", Code: completionContractErrorCode(err), Reason: err.Error()}
 					c.recordDecision(ctx, "completion_contract_rejected", err.Error())
+					if contract.MaxContinuations > 0 {
+						action, verificationReason := contract.verificationStop(err, progress.Snapshot(), c.totals.verificationContinuations, c.totals.noCheckConfirmations > 0)
+						if action == verificationEndUnverified && contract.ValidateFinalResponse != nil && contract.ValidateFinalResponse(text) != nil {
+							// An answer that fails its output contract cannot end the run.
+							action = verificationContinue
+						}
+						switch action {
+						case verificationEndUnverified:
+							// The work is done and no check can verify it. End with an
+							// explicit conclusive outcome that says so, not a loop.
+							result.Termination = Termination{Kind: TerminationCompletedUnverified, Code: TerminationCompletedUnverified, Reason: verificationReason}
+							c.recordDecision(ctx, TerminationCompletedUnverified, verificationReason)
+							result.CompletionStatus = CompletionConclusive
+							if c.cfg.History != nil {
+								c.cfg.History.Append(msg)
+							}
+							return result, nil
+						case verificationEndStalled:
+							result.Termination = Termination{Kind: TerminationVerificationStalled, Code: TerminationVerificationStalled, Reason: verificationReason}
+							c.recordDecision(ctx, TerminationVerificationStalled, verificationReason)
+							return result, result.RequireConclusive()
+						}
+						if c.totals.continuations >= contract.MaxContinuations {
+							result.Termination = Termination{Kind: "continuation_limit", Code: "continuation_limit", Reason: fmt.Sprintf("reached the %d-continuation limit: %s", contract.MaxContinuations, err)}
+							c.recordDecision(ctx, "continuation_limit", result.Termination.Reason)
+							return result, result.RequireConclusive()
+						}
+						if !c.completionRepairBudgetAvailable(result) {
+							result.Termination = Termination{Kind: "emergency_fuse", Code: "emergency_fuse", Reason: "completion requires more work but the model, tool, or cost budget is exhausted"}
+							c.recordDecision(ctx, "emergency_fuse", result.Termination.Reason)
+							return result, result.RequireConclusive()
+						}
+						if contract.MaxNoChangeContinuations > 0 && completionContractErrorCode(err) == string(CompletionMissingObservableChange) {
+							if c.totals.noChangeContinuations >= contract.MaxNoChangeContinuations {
+								result.Termination = Termination{Kind: "no_observable_change", Code: "no_observable_change", Reason: fmt.Sprintf("the model answered %d times without changing the workspace; if the task needs no file changes, say so in the brief: %s", c.totals.noChangeContinuations+1, err)}
+								c.recordDecision(ctx, "no_observable_change", result.Termination.Reason)
+								return result, result.RequireConclusive()
+							}
+							c.totals.noChangeContinuations++
+						}
+						c.totals.continuations++
+						if isVerificationContractError(err) {
+							c.totals.verificationContinuations++
+						}
+						instruction := continuationInstruction(err, text)
+						if action == verificationConfirm {
+							c.totals.noCheckConfirmations++
+							instruction = noCheckConfirmationInstruction(verificationReason, text)
+						}
+						if c.cfg.History != nil {
+							c.cfg.History.Append(msg)
+							c.cfg.History.Append(model.Message{Role: "user", Content: instruction})
+						}
+						c.recordDecision(ctx, "oneshot_continuation", err.Error())
+						if contract.OnContinuation != nil {
+							contract.OnContinuation(c.totals.continuations, err.Error())
+						}
+						continue
+					}
 					if c.totals.completionRepairAttempts < contract.MaxRepairAttempts && c.completionRepairBudgetAvailable(result) {
 						c.totals.completionRepairAttempts++
 						if c.cfg.History != nil {
@@ -1202,6 +1309,9 @@ func (c *Controller) finalizeStoppedTurn(ctx context.Context, result *Result, ro
 		return result, nil
 	}
 	result.Termination.FinalizationAttempted = true
+	if c.cfg.OnStop != nil {
+		c.cfg.OnStop(result.Termination)
+	}
 	c.recordDecision(ctx, "finalization_started", result.Termination.Reason)
 	if c.cfg.MaxModelRequests > 0 && result.ModelRequests >= c.cfg.MaxModelRequests {
 		return c.failFinalization(ctx, result, fmt.Errorf("explicit %d-request child limit left no request for final synthesis", c.cfg.MaxModelRequests))
@@ -3002,6 +3112,10 @@ func (c *Controller) persistToolOutcome(ctx context.Context, state *toolRoundSta
 	}
 	record["verification_observed"] = outcome.VerificationObserved
 	record["verification_passed"] = outcome.VerificationPassed
+	if outcome.VerificationUnavailable {
+		record["verification_unavailable"] = true
+		record["verification_unavailable_reason"] = modelstep.NormalizeErrorText(outcome.VerificationUnavailableReason)
+	}
 	record["yield_observed"] = outcome.YieldObserved
 	if outcome.YieldObserved {
 		record["yield_count"] = outcome.YieldCount
@@ -3068,6 +3182,13 @@ func (c *Controller) observeToolRound(ctx context.Context, state *toolRoundState
 		decision = mergeGovernorDecisions(decision, progressDecision)
 		if strings.TrimSpace(decision.Nudge) != "" {
 			content += "\n\n" + decision.Nudge
+		}
+		if outcome.VerificationUnavailable || (outcome.VerificationObserved && !outcome.VerificationPassed) {
+			if contract, enabled := c.completionContract(); enabled && contract.MaxContinuations > 0 {
+				if nudge := contract.verificationNudge(progress.Snapshot(), outcome.VerificationUnavailable); nudge != "" {
+					content += "\n\n" + nudge
+				}
+			}
 		}
 		if index == len(state.calls)-1 && !decision.Stop && !stopDecision.Stop {
 			if remaining := c.cfg.Governor.RemainingToolCalls(); remaining >= 1 && remaining <= 3 {

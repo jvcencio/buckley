@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -39,6 +40,7 @@ import (
 	"m31labs.dev/buckley/pkg/tool/builtin"
 	"m31labs.dev/buckley/pkg/tooloutcome"
 	"m31labs.dev/buckley/pkg/types"
+	"m31labs.dev/buckley/pkg/workspaceevidence"
 )
 
 const defaultACPSystemPrompt = prompts.DefaultToolUseSystemPrompt + "\n\nUse create_skill when the user explicitly asks to create a new skill."
@@ -1091,9 +1093,11 @@ func applyACPSetModelConfigOption(cfg *config.Config, mgr *model.Manager, sessio
 // whether any round has executed tools yet (the finalize-nudge gate), and
 // the last phase update sent (sendACPPhaseUpdate dedupes on it).
 type acpLoopState struct {
-	useTools        bool
-	toolTurnEnabled bool
-	allowedTools    []string
+	allowHostTools        bool
+	bestEffortObservation bool
+	useTools              bool
+	toolTurnEnabled       bool
+	allowedTools          []string
 	// route is resolved once after execution-model selection. Every request
 	// built during this prompt carries it so streaming dispatch can reject a
 	// hook/routing change before an upstream provider sees the request.
@@ -1152,6 +1156,16 @@ func runACPLoop(
 }
 
 type acpLoopLimits struct {
+	allowHostTools        bool
+	longMutation          bool
+	bestEffortObservation bool
+	Persist               bool
+	MaxContinuations      int
+	// noChangeExpected marks a brief that forbids file changes; the run ends
+	// with a report instead of an observable workspace change.
+	noChangeExpected      bool
+	OnContinuation        func(int, string)
+	OnStop                func(agentloop.Termination)
 	ValidateFinalResponse func(string) error
 	SubmittedResponse     func() (string, bool)
 	RequiredSourceText    []string
@@ -1248,6 +1262,8 @@ func runACPLoopWithLimits(
 		defer childMailbox.Close()
 	}
 	state := &acpLoopState{
+		allowHostTools:                   limits.allowHostTools,
+		bestEffortObservation:            limits.bestEffortObservation,
 		useTools:                         acpModelCanUseTools(registry, mgr, route),
 		route:                            route,
 		toolsCatalogConfirmedUnavailable: mgr.ToolsCatalogConfirmedUnavailableForRoute(route),
@@ -1258,7 +1274,7 @@ func runACPLoopWithLimits(
 		state.contextWindow, _ = mgr.GetContextLengthForRoute(route)
 	}
 
-	ctrl, err := newACPLoopController(cfg, mgr, conv, registry, skillState, engine, modelID, workDir, sessionID, agent, logf, stream, state, limits)
+	ctrl, err := newACPLoopController(ctx, cfg, mgr, conv, registry, skillState, engine, modelID, workDir, sessionID, agent, logf, stream, state, limits)
 	if err != nil {
 		return "", err
 	}
@@ -1490,6 +1506,7 @@ func (e *partialStreamTurnError) Unwrap() error { return e.cause }
 //     (empty or prose-only) response is dropped from the transcript
 //     entirely, exactly as before.
 func newACPLoopController(
+	ctx context.Context,
 	cfg *config.Config,
 	mgr *model.Manager,
 	conv *conversation.Conversation,
@@ -1513,7 +1530,7 @@ func newACPLoopController(
 			return model.ChatRequest{}, err
 		}
 		state.lastPhase = sendACPPhaseUpdate(stream, state.lastPhase, "Thinking…")
-		toolTurn := buildACPToolTurn(registry, skillState, evaluator, state.useTools, agent != nil, governor.ActionRequired(), limits.TaskIntent)
+		toolTurn := buildACPToolTurn(registry, skillState, evaluator, state.useTools, agent != nil || limits.allowHostTools, governor.ActionRequired(), limits.TaskIntent, limits.allowHostTools)
 		state.useTools = toolTurn.UseTools
 		state.toolTurnEnabled = toolTurn.Enabled
 		state.allowedTools = toolTurn.AllowedTools
@@ -1529,6 +1546,25 @@ func newACPLoopController(
 	}
 
 	completionContract := acpCompletionContract(limits)
+	if completionContract != nil && completionContract.RequireObservableChange && limits.bestEffortObservation && strings.TrimSpace(workDir) != "" {
+		mutations, observationErr := workspaceevidence.NewGitMutationRecorder(ctx, workDir)
+		if observationErr == nil {
+			completionContract.ObserveObservableChange = func() (bool, error) { return mutations.Observe(ctx) }
+			completionContract.ObserveWorkspaceState = func() (string, error) {
+				state, err := workspaceevidence.GitStateFingerprintWithFallback(ctx, workDir)
+				return state.Digest, err
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "One-shot observation: session baseline unavailable: %v\n", observationErr)
+		}
+	}
+	if completionContract != nil && limits.MaxContinuations > 0 && strings.TrimSpace(workDir) != "" {
+		// A continuing run that lacks verification ends as completed_unverified
+		// when the workspace has no test or build command to run, instead of
+		// asking the model for a check that cannot exist.
+		root := workDir
+		completionContract.VerificationSurface = func() (bool, string) { return builtin.HasVerificationSurface(root) }
+	}
 	callModel := agentloop.ModelCallerFunc(func(ctx context.Context, req model.ChatRequest, _ bool) (*model.ChatResponse, error) {
 		// Controller may turn a tool-bearing round into a final synthesis
 		// request. Record this post-controller shape, not the earlier build
@@ -1619,6 +1655,7 @@ func newACPLoopController(
 		lifecycleSessionID = strings.TrimSpace(sessionID)
 	}
 	controllerConfig := agentloop.ControllerConfig{
+		OnStop:                  limits.OnStop,
 		Governor:                governor,
 		StepCap:                 limits.StepCap,
 		FinalizeOnStop:          true,
@@ -1661,11 +1698,11 @@ func newACPToolLoopGovernor(cfg *config.Config) *agentloop.Governor {
 
 func acpCompletionContract(limits acpLoopLimits) *agentloop.CompletionContract {
 	depth := strings.ToLower(strings.TrimSpace(limits.VerificationDepth))
-	if depth == "legacy" && limits.ValidateFinalResponse == nil && limits.SubmittedResponse == nil {
+	if limits.MaxContinuations == 0 && depth == "legacy" && limits.ValidateFinalResponse == nil && limits.SubmittedResponse == nil {
 		return nil
 	}
-	requireVerification := depth != "none" && depth != "off" && depth != "legacy"
-	requireChange := depth != "legacy" && limits.TaskIntent == agentloop.MutationIntent
+	requireVerification := limits.MaxContinuations > 0 || (depth != "none" && depth != "off" && depth != "legacy")
+	requireChange := (depth != "legacy" || limits.MaxContinuations > 0) && limits.TaskIntent == agentloop.MutationIntent && !limits.noChangeExpected
 	if !requireVerification && !requireChange && limits.ValidateFinalResponse == nil && limits.SubmittedResponse == nil {
 		return nil
 	}
@@ -1677,6 +1714,13 @@ func acpCompletionContract(limits acpLoopLimits) *agentloop.CompletionContract {
 		RequirePostChangeVerification: requireVerification,
 		RequireObservableChange:       requireChange,
 		MaxRepairAttempts:             attempts,
+		MaxContinuations:              limits.MaxContinuations,
+		MaxNoChangeContinuations:      maxNoChangeContinuations(limits),
+		MaxVerificationUnavailable:    verificationLimit(limits, defaultMaxVerificationUnavailable),
+		MaxVerificationStalls:         verificationLimit(limits, defaultMaxVerificationStalls),
+		MaxVerificationContinuations:  verificationLimit(limits, defaultMaxVerificationContinuations),
+		OnContinuation:                limits.OnContinuation,
+		TolerateObservationErrors:     limits.bestEffortObservation,
 		TaskIntent:                    limits.TaskIntent,
 		ValidateFinalResponse:         limits.ValidateFinalResponse,
 		SubmittedResponse:             limits.SubmittedResponse,
@@ -1686,13 +1730,14 @@ func acpCompletionContract(limits acpLoopLimits) *agentloop.CompletionContract {
 
 func newACPToolLoopGovernorWithLimits(cfg *config.Config, limits acpLoopLimits) *agentloop.Governor {
 	governorConfig := agentloop.DefaultConfig()
-	if limits.ChildContract {
+	if limits.ChildContract || limits.longMutation {
 		// Remove the legacy 32/96 per-turn defaults. Explicitly configured
 		// operator emergency fuses below remain global runaway protection; they
 		// are distinct from the optional child task budget.
 		governorConfig.MaxRounds = math.MaxInt
 		governorConfig.MaxToolCalls = math.MaxInt
 	}
+	governorConfig.WarnOnSuccessfulRepeats = limits.longMutation
 	if cfg != nil {
 		if limit := cfg.AgentController.EmergencyFuse.ModelRequests; limit > 0 {
 			governorConfig.MaxRounds = limit
@@ -1851,7 +1896,7 @@ func buildACPStreamChatResponse(req model.ChatRequest, turn acpStreamTurn) *mode
 // releasing its deltas early would duplicate them if the replay succeeds.
 func streamACPTurnWithDelivery(ctx context.Context, mgr *model.Manager, req model.ChatRequest, stream acp.StreamFunc, deferDelivery bool) (acpStreamTurn, error) {
 	req.Stream = true
-	retryAllowed := acpStreamRetryAllowed(req)
+	retryAllowed := acpStreamRetryAllowed(req) || acpReplaySafeStream(ctx)
 	bufferDelivery := deferDelivery || retryAllowed
 
 	first, firstErr := streamACPTurnAttempt(ctx, mgr, req, stream, bufferDelivery)
@@ -1862,7 +1907,7 @@ func streamACPTurnWithDelivery(ctx context.Context, mgr *model.Manager, req mode
 		return first, nil
 	}
 
-	if !retryAllowed || !acpStreamRetryCandidate(ctx, first, firstErr) {
+	if !retryAllowed || acpStreamRetryLimit(ctx, first, firstErr) == 0 {
 		if bufferDelivery && !deferDelivery {
 			flushACPStreamUpdates(stream, first.Updates)
 		}
@@ -1875,32 +1920,121 @@ func streamACPTurnWithDelivery(ctx context.Context, mgr *model.Manager, req mode
 		return first, errors.Join(ctxErr, firstErr)
 	}
 
-	// Keep the second attempt buffered too. If it fails, no fragment from
-	// either inference is presented as an accepted assistant answer.
-	second, secondErr := streamACPTurnAttempt(ctx, mgr, req, stream, true)
-	if secondErr == nil {
-		second.Attempts = []acpStreamAttemptEvidence{
-			{turn: first, err: firstErr},
-			{turn: second},
+	// Keep every retry buffered too. If they all fail, no fragment from any
+	// inference is presented as an accepted assistant answer.
+	attempts := []acpStreamAttemptEvidence{{turn: first, err: firstErr}}
+	cur, curErr := first, firstErr
+	for retries := 0; ; retries++ {
+		if retries >= acpStreamRetryLimit(ctx, cur, curErr) {
+			break
 		}
-		second.Usage = aggregateACPStreamAttemptUsage(second.Attempts)
-		if !deferDelivery {
-			flushACPStreamUpdates(stream, second.Updates)
+		if isRetryableHTTPGatewayError(curErr) {
+			if waitErr := acpStreamRetrySleep(ctx, retries+1); waitErr != nil {
+				return cur, errors.Join(waitErr, curErr)
+			}
 		}
-		return second, nil
+		next, nextErr := streamACPTurnAttempt(ctx, mgr, req, stream, true)
+		attempts = append(attempts, acpStreamAttemptEvidence{turn: next, err: nextErr})
+		if nextErr == nil {
+			next.Attempts = attempts
+			next.Usage = aggregateACPStreamAttemptUsage(attempts)
+			if !deferDelivery {
+				flushACPStreamUpdates(stream, next.Updates)
+			}
+			return next, nil
+		}
+		cur, curErr = next, nextErr
 	}
 
-	second.Attempts = []acpStreamAttemptEvidence{
-		{turn: first, err: firstErr},
-		{turn: second, err: secondErr},
+	cur.Attempts = attempts
+	cur.Usage = aggregateACPStreamAttemptUsage(attempts)
+	errs := make([]error, 0, len(attempts))
+	for _, attempt := range attempts {
+		errs = append(errs, attempt.err)
 	}
-	second.Usage = aggregateACPStreamAttemptUsage(second.Attempts)
-	return second, &partialStreamTurnError{
-		cause:    errors.Join(firstErr, secondErr),
-		text:     model.ExtractTextContentOrEmpty(second.Message.Content),
-		turn:     second,
-		attempts: second.Attempts,
+	return cur, &partialStreamTurnError{
+		cause:    errors.Join(errs...),
+		text:     model.ExtractTextContentOrEmpty(cur.Message.Content),
+		turn:     cur,
+		attempts: attempts,
 	}
+}
+
+type acpReplaySafeStreamKey struct{}
+
+// withACPReplaySafeStream marks a context whose stream consumer only counts
+// progress (headless one-shot mode). Assistant deltas are buffered until a
+// turn ends, so a replay after a transient provider failure cannot duplicate
+// output, even when earlier rounds executed tools.
+func withACPReplaySafeStream(ctx context.Context) context.Context {
+	return context.WithValue(ctx, acpReplaySafeStreamKey{}, true)
+}
+
+func acpReplaySafeStream(ctx context.Context) bool {
+	v, _ := ctx.Value(acpReplaySafeStreamKey{}).(bool)
+	return v
+}
+
+const (
+	acpTransportRetryLimit = 1
+	acpGatewayRetryLimit   = 3
+)
+
+// acpStreamRetrySleep waits before gateway-error retry n (1-based). Tests
+// replace it.
+var acpStreamRetrySleep = func(ctx context.Context, attempt int) error {
+	delay := time.Duration(attempt*attempt) * 2 * time.Second // 2s, 8s, 18s
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// isRetryableHTTPGatewayError reports whether every leaf of err is an HTTP
+// 502, 503, or 504 from the provider. Auth, payment, quota, and rate-limit
+// errors (401, 402, 403, 429) are never gateway errors, and a 5xx body that
+// names a quota, credit, or billing problem is excluded too.
+func isRetryableHTTPGatewayError(err error) bool {
+	return acpEveryErrorLeaf(err, func(leaf error) bool {
+		var apiErr *model.APIError
+		if !errors.As(leaf, &apiErr) {
+			return false
+		}
+		switch apiErr.StatusCode {
+		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		default:
+			return false
+		}
+		text := strings.ToLower(apiErr.Message + " " + apiErr.Details + " " + apiErr.Code + " " + apiErr.Type)
+		for _, word := range []string{"quota", "credit", "billing", "insufficient", "payment", "unauthorized", "forbidden"} {
+			if strings.Contains(text, word) {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// acpStreamRetryLimit returns how many replays a failed attempt may get. It
+// is 0 when the partial response carried any tool-call material.
+func acpStreamRetryLimit(ctx context.Context, turn acpStreamTurn, err error) int {
+	if err == nil || ctx.Err() != nil || strings.TrimSpace(turn.FinishReason) != "" {
+		return 0
+	}
+	if len(turn.Message.ToolCalls) > 0 || turn.ObservedToolDelta || isContextCancellationError(err) {
+		return 0
+	}
+	if isRetryableHTTPGatewayError(err) && ctx.Err() == nil {
+		return acpGatewayRetryLimit
+	}
+	if acpEveryErrorLeaf(err, isRetryableStreamTransportErrorLeaf) && ctx.Err() == nil {
+		return acpTransportRetryLimit
+	}
+	return 0
 }
 
 func streamACPTurnAttempt(ctx context.Context, mgr *model.Manager, req model.ChatRequest, stream acp.StreamFunc, deferDelivery bool) (acpStreamTurn, error) {
@@ -1943,17 +2077,6 @@ func acpStreamRetryAllowed(req model.ChatRequest) bool {
 		}
 	}
 	return true
-}
-
-func acpStreamRetryCandidate(ctx context.Context, turn acpStreamTurn, err error) bool {
-	if err == nil || ctx.Err() != nil || strings.TrimSpace(turn.FinishReason) != "" {
-		return false
-	}
-	if len(turn.Message.ToolCalls) > 0 || turn.ObservedToolDelta || isContextCancellationError(err) {
-		return false
-	}
-	safe := acpEveryErrorLeaf(err, isRetryableStreamTransportErrorLeaf)
-	return safe && ctx.Err() == nil
 }
 
 // isRetryableStreamTransportErrorLeaf reports whether a leaf error (the
@@ -2440,13 +2563,13 @@ func acpModelCanUseTools(registry *tool.Registry, mgr *model.Manager, route mode
 	return registry != nil && (mgr == nil || mgr.OfferToolsForRoute(route))
 }
 
-func buildACPToolTurn(registry *tool.Registry, skillState *skill.RuntimeState, evaluator types.RuleEvaluator, useTools bool, permissionAvailable bool, actionRequired bool, intent agentloop.TaskIntent) acpToolTurn {
+func buildACPToolTurn(registry *tool.Registry, skillState *skill.RuntimeState, evaluator types.RuleEvaluator, useTools bool, permissionAvailable bool, actionRequired bool, intent agentloop.TaskIntent, hostTools ...bool) acpToolTurn {
 	turn := acpToolTurn{UseTools: useTools}
 	if skillState != nil {
 		turn.AllowedTools = skillState.ToolFilter()
 	}
 	if actionRequired && intent != agentloop.ReadOnlyIntent && registry != nil {
-		turn.AllowedTools = acpActionToolNames(registry, turn.AllowedTools)
+		turn.AllowedTools = acpActionToolNames(registry, turn.AllowedTools, len(hostTools) > 0 && hostTools[0])
 	}
 	if !permissionAvailable && registry != nil {
 		turn.AllowedTools = acpFallbackAllowedToolNames(registry, turn.AllowedTools)
@@ -2491,7 +2614,7 @@ func acpFallbackAllowedToolNames(registry *tool.Registry, allowed []string) []st
 // acpActionToolNames keeps state-changing tools plus the bounded control and
 // verification surfaces needed to finish honestly after discovery is parked.
 // It deliberately excludes general read/search and destructive escape hatches.
-func acpActionToolNames(registry *tool.Registry, allowed []string) []string {
+func acpActionToolNames(registry *tool.Registry, allowed []string, hostTools bool) []string {
 	allowedSet := make(map[string]struct{}, len(allowed))
 	for _, name := range allowed {
 		allowedSet[name] = struct{}{}
@@ -2506,7 +2629,7 @@ func acpActionToolNames(registry *tool.Registry, allowed []string) []string {
 		}
 		metadata := tool.GetMetadata(registered)
 		verificationOrControl := metadata.Impact == tool.ImpactReadOnly && (metadata.Verification || isACPActionSupportTool(name))
-		if metadata.Impact == tool.ImpactModifying || verificationOrControl {
+		if metadata.Impact == tool.ImpactModifying || verificationOrControl || (hostTools && isHostActionTool(name)) {
 			names = append(names, name)
 		}
 	}
@@ -2816,7 +2939,7 @@ func dispatchACPToolCall(ctx context.Context, registry *tool.Registry, evaluator
 		return agentloop.ToolOutcome{Content: toolText, Error: toolText, EffectClass: effectClass}
 	}
 
-	if allowed, reason := requestACPToolPermission(ctx, agent, registry, sessionID, tc, params, workDir, logf); !allowed {
+	if allowed, reason := requestACPToolPermission(ctx, agent, registry, sessionID, tc, params, workDir, logf); !allowed && !(agent == nil && state.allowHostTools && ctx.Err() == nil) {
 		toolText := fmt.Sprintf("Permission denied for %s: %s", tc.Function.Name, reason)
 		result := &builtin.Result{Success: false, Error: toolText}
 		sendACPToolCallUpdate(stream, tc, params, acp.ToolCallStatusFailed, toolText, map[string]any{
@@ -2830,9 +2953,17 @@ func dispatchACPToolCall(ctx context.Context, registry *tool.Registry, evaluator
 	if registry != nil {
 		if registered, ok := registry.Get(tc.Function.Name); ok {
 			metadata = tool.GetMetadata(registered)
+			if _, shell := registered.(*builtin.ShellCommandTool); shell {
+				metadata.Verification = builtin.IsVerificationCall(params)
+			}
 		}
 	}
-	observation := tooloutcome.BeginWithMetadata(ctx, workDir, metadata)
+	var observation tooloutcome.Observation
+	if state.bestEffortObservation {
+		observation = tooloutcome.BeginBestEffortWithMetadata(ctx, workDir, metadata)
+	} else {
+		observation = tooloutcome.BeginWithMetadata(ctx, workDir, metadata)
+	}
 	result, execErr := executeACPToolCall(ctx, registry, tc.Function.Name, params, tc.ID)
 	toolText := formatACPToolResult(result, execErr)
 	toolText = tool.AppendCodeModeRecoveryGuidance(toolText, evaluator, registry, state.allowedTools, tc.Function.Name, result, execErr, state.codeModeRecovery)
@@ -2850,7 +2981,7 @@ func dispatchACPToolCall(ctx context.Context, registry *tool.Registry, evaluator
 	} else if result != nil {
 		errorText = result.Error
 	}
-	return observation.Finish(ctx, agentloop.ToolOutcome{
+	outcome := observation.Finish(ctx, agentloop.ToolOutcome{
 		Content:       toolText,
 		Success:       execErr == nil && result != nil && result.Success,
 		EffectClass:   effectClass,
@@ -2860,6 +2991,24 @@ func dispatchACPToolCall(ctx context.Context, registry *tool.Registry, evaluator
 		YieldCount:    yield.Count,
 		YieldUnit:     yield.Unit,
 	}, metadata, result, execErr)
+	if state.bestEffortObservation && outcome.StateObservationError != "" {
+		fmt.Fprintf(os.Stderr, "One-shot observation: tool=%s warning=%q; continuing\n", tc.Function.Name, outcome.StateObservationError)
+	}
+	if state.bestEffortObservation && (outcome.VerificationObserved || outcome.VerificationUnavailable) {
+		command, _ := params["command"].(string)
+		command = summarizeOneShotCommand(command)
+		// run_tests takes a path, not a command; name it so the line is readable.
+		target := ""
+		if path, _ := params["path"].(string); command == "" && strings.TrimSpace(path) != "" {
+			target = fmt.Sprintf(" path=%q", summarizeOneShotCommand(path))
+		}
+		if outcome.VerificationUnavailable {
+			fmt.Fprintf(os.Stderr, "One-shot verification: tool=%s command=%q%s unavailable=%q\n", tc.Function.Name, command, target, outcome.VerificationUnavailableReason)
+		} else {
+			fmt.Fprintf(os.Stderr, "One-shot verification: tool=%s command=%q%s passed=%t\n", tc.Function.Name, command, target, outcome.VerificationPassed)
+		}
+	}
+	return outcome
 }
 
 // rejectACPUnexpectedToolCall records a model's structured call as a visible
@@ -2926,128 +3075,16 @@ func acpToolRiskImpact(registry *tool.Registry, name string, params map[string]a
 	return impact
 }
 
-// verificationShellCommandPrefixes lists build/vet/test/lint commands that
-// check the workspace without mutating it. Buckley's default risk policy
-// (used when no live ACP client is attached -- e.g. the headless oneshot
-// CLI path) treats a run_shell command matching one of these prefixes as
-// non-destructive, so a correct edit is not stranded "incomplete" for want
-// of its own post-change verification (H10).
-var verificationShellCommandPrefixes = []string{
-	"go build",
-	"go vet",
-	"go test",
-	"gofmt -l",
-	"golangci-lint",
-	"staticcheck",
-	"go lint",
-	"npm test",
-	"npm run test",
-	"npm run build",
-	"npm run lint",
-	"cargo build",
-	"cargo test",
-	"cargo check",
-	"cargo clippy",
-	"pytest",
-	"make test",
-	"make build",
-	"make vet",
-	"make lint",
-}
-
-// isWorkspaceVerificationToolCall reports whether a tool call is a
-// build/vet/test/lint check of the workspace. Only run_shell is eligible:
-// run_code executes arbitrary caller-supplied code, not a fixed command, so
-// it keeps its destructive classification.
 func isWorkspaceVerificationToolCall(name string, params map[string]any) bool {
-	if name != "run_shell" {
+	if name != "run_shell" && name != "run_verification" {
 		return false
 	}
 	command, _ := params["command"].(string)
 	return isWorkspaceVerificationCommand(command)
 }
 
-// verificationCommandExecFlags are flags that make a build/test tool run an
-// arbitrary program or write outside the workspace, so a "verification"
-// command carrying one is no longer read-only.
-var verificationCommandExecFlags = []string{
-	"-exec", "-toolexec", "-vettool", "-overlay", "-modfile", "-o",
-	"--config", "--target-dir", "--manifest-path",
-	// Flags that load build rules or code from another file or directory:
-	// make -f/-C/-I, npm --prefix, pytest -c/--rootdir.
-	"-f", "--file", "--makefile", "-c", "--directory", "-i", "--include-dir",
-	"--prefix", "--rootdir",
-}
-
-// isWorkspaceRelativeArg reports whether arg names only paths inside the
-// workspace: no absolute or home-relative path and no parent traversal.
-func isWorkspaceRelativeArg(arg string) bool {
-	if strings.HasPrefix(arg, "/") || strings.HasPrefix(arg, "~") {
-		return false
-	}
-	// Compare whole segments: "./..." is Go's package wildcard, not traversal.
-	for _, segment := range strings.Split(arg, "/") {
-		if segment == ".." {
-			return false
-		}
-	}
-	return true
-}
-
-// isVerificationCommandByte reports whether b may appear in a verification
-// command. It is an allowlist: bash -lc treats newline, carriage return,
-// backslash, quotes, and every control operator as syntax, so anything
-// outside plain words, spaces, and path/flag punctuation is rejected.
-func isVerificationCommandByte(b byte) bool {
-	switch {
-	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
-		return true
-	}
-	return strings.IndexByte(" -_./=:,@+%*", b) >= 0
-}
-
-// isWorkspaceVerificationCommand reports whether command is a known
-// build/vet/test/lint prefix with nothing chained after it. The command may
-// hold only allowlisted bytes (see isVerificationCommandByte), so no shell
-// separator, escape, quote, or substitution can smuggle a second command
-// past the prefix, and it may not carry a flag that executes another
-// program (see verificationCommandExecFlags).
 func isWorkspaceVerificationCommand(command string) bool {
-	trimmed := strings.TrimSpace(command)
-	if trimmed == "" {
-		return false
-	}
-	for i := 0; i < len(trimmed); i++ {
-		if !isVerificationCommandByte(trimmed[i]) {
-			return false
-		}
-	}
-	for _, field := range strings.Fields(trimmed) {
-		name, value, hasValue := strings.Cut(strings.ToLower(field), "=")
-		for _, flag := range verificationCommandExecFlags {
-			if name == flag || name == "-"+flag {
-				return false
-			}
-		}
-		if !strings.HasPrefix(field, "-") {
-			if !isWorkspaceRelativeArg(field) {
-				return false
-			}
-			continue
-		}
-		// A flag may carry a path only as a relative "=value": an attached
-		// short-flag value such as make's -f/tmp/x would dodge the name check.
-		if strings.Contains(name, "/") || (hasValue && !isWorkspaceRelativeArg(value)) {
-			return false
-		}
-	}
-	lower := strings.ToLower(trimmed)
-	for _, prefix := range verificationShellCommandPrefixes {
-		if lower == prefix || strings.HasPrefix(lower, prefix+" ") {
-			return true
-		}
-	}
-	return false
+	return builtin.IsVerificationCommand(command)
 }
 
 // acpRiskLabel maps a tool.Impact to the risk vocabulary Buckley's local
@@ -3151,6 +3188,7 @@ func sendACPToolCallStart(stream acp.StreamFunc, call model.ToolCall, params map
 	update := acp.SessionUpdate{
 		SessionUpdate: acp.SessionUpdateToolCall,
 		ToolCallID:    call.ID,
+		ToolName:      call.Function.Name,
 		Title:         toolCallTitle(call.Function.Name, params),
 		Kind:          toolCallKind(call.Function.Name),
 		Status:        acp.ToolCallStatusInProgress,

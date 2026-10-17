@@ -37,8 +37,10 @@ var configValidators = []func(*Config) error{
 	validateMemoryLimits,
 	validateAgentCostLimits,
 	validateBuckbotPrivacyFallback,
+	validateOpenRouterBYOKProviders,
 	validateOneshotDataPolicy,
 	validateDecisions,
+	validateReviewVerificationRunner,
 }
 
 // Validate checks configuration values for correctness and returns an
@@ -94,10 +96,10 @@ func validateReasoning(c *Config) error {
 	validReasoning := map[string]bool{
 		"auto": true,
 		"off":  true, "none": true,
-		"minimal": true, "low": true, "medium": true, "high": true, "xhigh": true,
+		"minimal": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true,
 	}
 	if !validReasoning[reasoning] {
-		return fmt.Errorf("invalid reasoning level: %s (valid: auto, off, minimal, low, medium, high, xhigh)", c.Models.Reasoning)
+		return fmt.Errorf("invalid reasoning level: %s (valid: auto, off, minimal, low, medium, high, xhigh, max)", c.Models.Reasoning)
 	}
 	return nil
 }
@@ -350,6 +352,46 @@ func validateAgentCostLimits(c *Config) error {
 	return nil
 }
 
+// validateOpenRouterBYOKProviders rejects empty pins and a pin placed on a
+// provider section that never reads it, so a misplaced setting fails loudly
+// instead of silently leaving requests on credit-billed routes.
+func validateOpenRouterBYOKProviders(c *Config) error {
+	for prefix, slug := range c.Providers.OpenRouter.BYOKProviders {
+		if strings.TrimSpace(prefix) == "" {
+			return fmt.Errorf("providers.openrouter.byok_providers has an empty model prefix")
+		}
+		if !validOpenRouterProviderSlug(strings.TrimSpace(slug)) {
+			return fmt.Errorf("providers.openrouter.byok_providers[%q] has invalid provider slug %q", prefix, slug)
+		}
+	}
+	others := map[string]ProviderSettings{
+		"openai":    c.Providers.OpenAI,
+		"anthropic": c.Providers.Anthropic,
+		"google":    c.Providers.Google,
+		"ollama":    c.Providers.Ollama,
+	}
+	for name, settings := range others {
+		if len(settings.BYOKProviders) > 0 {
+			return fmt.Errorf("providers.%s.byok_providers is not supported; set providers.openrouter.byok_providers", name)
+		}
+	}
+	return nil
+}
+
+func validOpenRouterProviderSlug(slug string) bool {
+	if slug == "" {
+		return false
+	}
+	for _, r := range slug {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_', r == '.', r == '/':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func validateBuckbotPrivacyFallback(c *Config) error {
 	value := strings.ToLower(strings.TrimSpace(c.Buckbot.OpenRouterPrivacyFallback))
 	switch value {
@@ -361,6 +403,9 @@ func validateBuckbotPrivacyFallback(c *Config) error {
 }
 
 func validateOneshotDataPolicy(c *Config) error {
+	if c.Oneshot.MaxContinuations != nil && *c.Oneshot.MaxContinuations < 0 {
+		return fmt.Errorf("oneshot.max_continuations must not be negative")
+	}
 	value := strings.ToLower(strings.TrimSpace(c.Oneshot.DataPolicy))
 	switch value {
 	case "", "none", "zdr", "deny":
@@ -469,4 +514,24 @@ func (c *Config) ValidationWarnings() []string {
 	}
 
 	return warnings
+}
+
+func validateReviewVerificationRunner(c *Config) error {
+	runner := c.Review.Verification.Runner
+	for _, command := range []struct {
+		name string
+		argv []string
+	}{
+		{"wrapper", runner.Wrapper}, {"cleanup", runner.Cleanup},
+	} {
+		for i, arg := range command.argv {
+			if strings.ContainsRune(arg, 0) || (i == 0 && strings.TrimSpace(arg) == "") {
+				return fmt.Errorf("review.verification.runner.%s[%d] must be a valid command argument", command.name, i)
+			}
+		}
+	}
+	if runner.Parallelism < 0 || runner.Timeout < 0 {
+		return fmt.Errorf("review.verification.runner parallelism and timeout must be zero or greater")
+	}
+	return nil
 }
